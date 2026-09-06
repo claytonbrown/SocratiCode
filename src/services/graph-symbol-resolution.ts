@@ -1265,10 +1265,15 @@ export function resolveCallSites(
       }
 
       // ── Signal emit resolution (GDScript only) ──────────────────────
-      // `signal_name.emit()` creates a raw call with calleeName = "signal:signal_name".
-      // Resolve to the signal definition symbol in the caller's file or dependencies.
-      if (isGdscript && edge.calleeName.startsWith("signal:")) {
-        const signalName = edge.calleeName.slice(7);
+      // `signal_name.emit()` carries an explicit marker so calleeName remains
+      // the raw identifier promised by SymbolEdge. Accept and normalize the
+      // pre-marker encoding so graphs produced by earlier builds still resolve.
+      if (isGdscript && (edge.signalEmit || edge.calleeName.startsWith("signal:"))) {
+        const signalName = edge.calleeName.startsWith("signal:")
+          ? edge.calleeName.slice(7)
+          : edge.calleeName;
+        edge.calleeName = signalName;
+        edge.signalEmit = true;
         const signalCandidates: string[] = [];
         // Look in local file first
         const localSignal = localIdx?.get(signalName);

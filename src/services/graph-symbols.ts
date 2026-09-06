@@ -62,6 +62,8 @@ export interface ExtractedSymbols {
     /** Receiver expression for method calls (e.g. "fighter" in "fighter.take_damage()").
      *  Present only for attribute_call nodes; bare calls have no receiver. */
     receiver?: string;
+    /** True when this call represents a GDScript `signal_name.emit()`. */
+    signalEmit?: boolean;
   }>;
   /** Inferred variable types from assignment sites (var x = Expr, x = Expr).
    *  Maps variable name → list of inferences, each with the enclosing scope's
@@ -2777,6 +2779,7 @@ function extractFromGodotResource(
   const nodeHeaderRegex = /^\[node\s+/;
   const subResourceHeaderRegex = /^\[sub_resource\s+/;
   const extResourceHeaderRegex = /^\[ext_resource\s+/;
+  const sectionHeaderRegex = /^\[/;
   const attrPairRegex = /(\w+)="([^"]*)"/g;
   // Match script = ExtResource("id") within node sections
   const scriptAssignRegex = /^script\s*=\s*ExtResource\(["']([^"']+)["']\)/;
@@ -2800,6 +2803,14 @@ function extractFromGodotResource(
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    // A script assignment belongs only to the immediately enclosing node
+    // section. Any other section ends that node, including connection and
+    // editable sections that do not otherwise produce symbols here.
+    if (sectionHeaderRegex.test(line) && !nodeHeaderRegex.test(line)) {
+      currentNodeName = null;
+      currentNodeType = null;
+    }
 
     // Ext resource declaration — extract path, type, and id from any order
     if (extResourceHeaderRegex.test(line)) {
@@ -3415,161 +3426,114 @@ function extractFromGdscript(
     "true", "false", "null",
   ]);
 
-  // Method calls: attribute → attribute_call
+  // Method calls: one attribute can contain several direct attribute_call
+  // children, as in `fighter.get_state().update()`. Process each direct child
+  // exactly once so the inner and terminal methods are both represented.
   for (const attr of safeFindAll(root, "attribute")) {
-    const attrCall = safeFind(attr, "attribute_call");
-    if (!attrCall) continue;
-    const methodId = safeFind(attrCall, "identifier");
-    if (!methodId) continue;
-    const callee = methodId.text();
-    // Signal emit/connect: `signal_name.emit(args)` or `signal_name.connect(handler)`
-    // These are not regular method calls — they create signal→handler edges.
-    // Record them as raw calls with a special receiver prefix so the
-    // resolver can create signal edges.
-    if (callee === "emit" || callee === "connect") {
-      const firstChild = kidsOf(attr)[0];
+    const attrChildren = kidsOf(attr);
+    const attrCalls = attrChildren.filter((child) => child.kind() === "attribute_call");
+
+    for (const attrCall of attrCalls) {
+      const methodId = safeFind(attrCall, "identifier");
+      if (!methodId) continue;
+      const callee = methodId.text();
+      const callIndex = attrChildren.indexOf(attrCall);
+      const receiverChildren = attrChildren.slice(0, callIndex);
+      const firstChild = receiverChildren[0];
+
+      // Receiver is the expression before this particular method call.
+      // Attribute-call names already traversed become receiver segments, so
+      // the terminal call in `fighter.get_state().update()` has receiver
+      // `fighter.get_state` while the inner call has receiver `fighter`.
+      let receiver: string | null = null;
       if (firstChild?.kind() === "identifier") {
-        const signalName = firstChild.text();
-        // For emit: signal_name.emit() → caller emits this signal
-        // For connect: signal_name.connect(handler) → handler is a callee
-        if (callee === "emit") {
-          rawCalls.push({
-            calleeName: `signal:${signalName}`,
-            kind: "call",
-            callSite: { file, line: lineOf(attr) },
-            callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
-          });
-        } else {
-          // connect: the first argument is the handler function/method
-          const args = safeFind(attrCall, "arguments");
-          if (args) {
-            const argKids = kidsOf(args);
-            // Find the first identifier argument (the handler)
-            for (const arg of argKids) {
-              if (arg.kind() === "identifier") {
-                rawCalls.push({
-                  calleeName: arg.text(),
-                  kind: "call",
-                  callSite: { file, line: lineOf(attr) },
-                  callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
-                });
-                break;
-              }
-              // self._on_hit form
-              if (arg.kind() === "attribute") {
-                const argIds = arg.findAll({ rule: { kind: "identifier" } });
-                if (argIds.length > 0) {
-                  // Use the last identifier as the handler name
-                  const handlerName = argIds[argIds.length - 1].text();
+        const receiverParts: string[] = [];
+        for (const child of receiverChildren) {
+          if (child.kind() === "identifier") receiverParts.push(child.text());
+          else if (child.kind() === "attribute_call") {
+            const priorMethodId = safeFind(child, "identifier");
+            if (priorMethodId) receiverParts.push(priorMethodId.text());
+          }
+        }
+        receiver = receiverParts.length > 0 ? receiverParts.join(".") : null;
+      } else if (firstChild?.kind() === "get_node") {
+        const gnText = firstChild.text();
+        const nodePath = gnText.startsWith("$")
+          ? gnText.slice(1)
+          : safeFind(firstChild, "string")?.text().replace(/^['"]|['"]$/g, "") ?? null;
+        if (nodePath) {
+          const receiverParts: string[] = [nodePath];
+          for (const child of receiverChildren.slice(1)) {
+            if (child.kind() === "identifier") receiverParts.push(child.text());
+            else if (child.kind() === "attribute_call") {
+              const priorMethodId = safeFind(child, "identifier");
+              if (priorMethodId) receiverParts.push(priorMethodId.text());
+            }
+          }
+          receiver = receiverParts.join(".");
+        }
+      }
+
+      // Signal emit/connect: `signal_name.emit(args)` or
+      // `signal_name.connect(handler)`. The signal is the final identifier
+      // immediately before this call; a preceding method call is dynamic and
+      // cannot safely be treated as a statically named signal.
+      if (callee === "emit" || callee === "connect") {
+        let precedingValue = null;
+        for (let i = receiverChildren.length - 1; i >= 0; i--) {
+          if (receiverChildren[i].kind() !== ".") {
+            precedingValue = receiverChildren[i];
+            break;
+          }
+        }
+        if (precedingValue?.kind() === "identifier") {
+          const signalName = precedingValue.text();
+          if (callee === "emit") {
+            rawCalls.push({
+              calleeName: signalName,
+              kind: "call",
+              callSite: { file, line: lineOf(attr) },
+              callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
+              signalEmit: true,
+            });
+          } else {
+            const args = safeFind(attrCall, "arguments");
+            if (args) {
+              for (const arg of kidsOf(args)) {
+                if (arg.kind() === "identifier") {
                   rawCalls.push({
-                    calleeName: handlerName,
+                    calleeName: arg.text(),
                     kind: "call",
-                    receiver: argIds.length > 1 ? argIds[0].text() : undefined,
                     callSite: { file, line: lineOf(attr) },
                     callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
                   });
                   break;
                 }
+                if (arg.kind() === "attribute") {
+                  const argIds = arg.findAll({ rule: { kind: "identifier" } });
+                  if (argIds.length > 0) {
+                    rawCalls.push({
+                      calleeName: argIds[argIds.length - 1].text(),
+                      kind: "call",
+                      receiver: argIds.length > 1 ? argIds[0].text() : undefined,
+                      callSite: { file, line: lineOf(attr) },
+                      callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
+                    });
+                    break;
+                  }
+                }
               }
             }
           }
         }
+        continue;
       }
-      continue; // Don't process emit/connect as regular method calls
-    }
 
-    // Receiver is the expression before the final dot+attribute_call.
-    // For single-hop: `fighter.attack()` → receiver = "fighter"
-    // For multi-hop:  `fighter.state.attack()` → receiver = "fighter.state"
-    //                 `fighter.state_machine.transition_to()` → receiver = "fighter.state_machine"
-    //                 `$Player.state.attack()` → receiver = "$Player.state"
-    // We build the receiver by collecting all identifier children before the
-    // attribute_call, joined by dots. For $NodePath receivers, the node path
-    // is the first part and subsequent identifiers are additional hops.
-    const firstChild = kidsOf(attr)[0];
-    let receiver: string | null = null;
-    if (firstChild?.kind() === "identifier") {
-      // Plain identifier chain: fighter.state.attack()
-      const receiverParts: string[] = [];
-      for (const child of kidsOf(attr)) {
-        if (child.kind() === "attribute_call") break; // Stop at the call
-        if (child.kind() === "identifier") {
-          receiverParts.push(child.text());
-        }
-        // Skip "." nodes — they're implicit in the dot-join
-      }
-      receiver = receiverParts.length > 0 ? receiverParts.join(".") : null;
-    } else if (firstChild?.kind() === "get_node") {
-      // $NodePath chain: $Fighter.state.attack()
-      // Extract the node path as the first part, then collect subsequent
-      // identifier hops to build the full receiver chain.
-      const gnText = firstChild.text();
-      let nodePath: string | null = null;
-      if (gnText.startsWith("$")) {
-        nodePath = gnText.slice(1); // Strip leading $
-      } else {
-        // get_node("path") form — extract string argument
-        const strNode = safeFind(firstChild, "string");
-        if (strNode) {
-          nodePath = strNode.text().replace(/^['"]|['"]$/g, "");
-        }
-      }
-      if (nodePath) {
-        // Collect subsequent identifier hops after the get_node
-        const receiverParts: string[] = [nodePath];
-        let pastGetNode = false;
-        for (const child of kidsOf(attr)) {
-          if (!pastGetNode) {
-            if (child === firstChild) pastGetNode = true;
-            continue;
-          }
-          if (child.kind() === "attribute_call") break;
-          if (child.kind() === "identifier") {
-            receiverParts.push(child.text());
-          }
-        }
-        receiver = receiverParts.join(".");
-      }
-    }
-    // Other first-child kinds (call, subscript, etc.) leave receiver null —
-    // the edge is recorded without a receiver and won't be receiver-resolved.
-    // For chained calls like `fighter.get_state().update()`, the first child
-    // is an `attribute` node. We can't resolve the return type of get_state()
-    // without method return type analysis, but we can at least record the
-    // terminal edge with the innermost receiver for best-effort resolution.
-    if (!receiver && firstChild?.kind() === "attribute") {
-      // Try to extract the base receiver from the inner attribute
-      const innerFirstChild = kidsOf(firstChild)[0];
-      if (innerFirstChild?.kind() === "identifier") {
-        // Use the inner attribute's receiver + method as the receiver chain
-        // e.g. fighter.get_state().update() → receiver = "fighter.get_state"
-        const innerParts: string[] = [];
-        for (const child of kidsOf(firstChild)) {
-          if (child.kind() === "attribute_call") {
-            const innerMethodId = safeFind(child, "identifier");
-            if (innerMethodId) innerParts.push(innerMethodId.text());
-            break;
-          }
-          if (child.kind() === "identifier") {
-            innerParts.push(child.text());
-          }
-        }
-        if (innerParts.length > 0) {
-          receiver = innerParts.join(".");
-        }
-      }
-    }
-
-    // Dynamic dispatch on attribute calls:
-    // `obj.call("method", ...)` → calleeName = "method" (first string arg)
-    // `obj.call_deferred("method", ...)` → calleeName = "method"
-    // `obj.emit_signal("signal_name", ...)` → calleeName = "signal_name"
-    // These are Object.call() / Object.call_deferred() / Object.emit_signal() —
-    // the first string argument is the method/signal name to invoke dynamically.
-    if (callee === "call" || callee === "call_deferred" || callee === "emit_signal") {
-      const args = safeFind(attrCall, "arguments");
-      if (args) {
-        const strNode = safeFind(args, "string");
+      // Dynamic dispatch on attribute calls uses the first string argument as
+      // the real method or signal name instead of exposing the helper method.
+      if (callee === "call" || callee === "call_deferred" || callee === "emit_signal") {
+        const args = safeFind(attrCall, "arguments");
+        const strNode = args ? safeFind(args, "string") : null;
         if (strNode) {
           const methodName = strNode.text().replace(/^['"]|['"]$/g, "");
           if (methodName && /^[A-Za-z_][\w]*$/.test(methodName)) {
@@ -3583,18 +3547,18 @@ function extractFromGdscript(
             });
           }
         }
+        continue;
       }
-      continue; // Don't emit "call"/"call_deferred" as callee names
-    }
 
-    const line = lineOf(attr);
-    rawCalls.push({
-      callerId: findCallerId(scopes, line, moduleSym.id),
-      calleeName: callee,
-      kind: "call",
-      callSite: { file, line },
-      ...(receiver ? { receiver } : {}),
-    });
+      const line = lineOf(attr);
+      rawCalls.push({
+        callerId: findCallerId(scopes, line, moduleSym.id),
+        calleeName: callee,
+        kind: "call",
+        callSite: { file, line },
+        ...(receiver ? { receiver } : {}),
+      });
+    }
   }
 
   // Bare function calls: call nodes (not inside an attribute)
@@ -3758,5 +3722,6 @@ export function rawCallsToUnresolvedEdges(
     calleeQualifier: c.calleeQualifier,
     callSite: c.callSite,
     ...(c.receiver ? { receiver: c.receiver } : {}),
+    ...(c.signalEmit ? { signalEmit: true } : {}),
   }));
 }

@@ -397,7 +397,22 @@ describe("GDScript symbol extraction (AST-based)", () => {
       expect(newCall?.receiver).toBe("Fighter");
     });
 
-    it("filters signal.emit() as engine API (emit is a Signal builtin)", () => {
+    it("extracts both calls in a chained receiver call without duplicating the inner call", () => {
+      const result = extractSymbolsAndCalls(
+        "class_name Test\nextends Node\n\nfunc _ready():\n    fighter.get_state().update()\n",
+        "gdscript",
+        ".gd",
+        "scripts/Test.gd",
+      );
+
+      const calls = result.rawCalls.filter((call) => call.callSite.line === 5);
+      expect(calls.filter((call) => call.calleeName === "get_state")).toHaveLength(1);
+      expect(calls.filter((call) => call.calleeName === "update")).toHaveLength(1);
+      expect(calls.find((call) => call.calleeName === "get_state")?.receiver).toBe("fighter");
+      expect(calls.find((call) => call.calleeName === "update")?.receiver).toBe("fighter.get_state");
+    });
+
+    it("extracts signal.emit() as a signal edge with the raw signal name", () => {
       const result = extractSymbolsAndCalls(
         "class_name Fighter\nextends Node\n\nsignal hit_landed(damage: int)\n\nfunc attack():\n    hit_landed.emit(10)\n",
         "gdscript",
@@ -405,10 +420,13 @@ describe("GDScript symbol extraction (AST-based)", () => {
         "scripts/Fighter.gd",
       );
 
-      // `emit` is a Godot Signal builtin method — filtered from call edges
-      // to avoid unresolved noise. The signal itself is extracted as a symbol.
+      // `emit` is implementation syntax, not the callee exposed by the graph.
       const emitCall = result.rawCalls.find((c) => c.calleeName === "emit");
       expect(emitCall).toBeUndefined();
+
+      const signalCall = result.rawCalls.find((c) => c.calleeName === "hit_landed");
+      expect(signalCall).toBeDefined();
+      expect(signalCall?.signalEmit).toBe(true);
 
       // The signal should be extracted as a symbol
       const sigSym = result.symbols.find((s) => s.name === "hit_landed" && s.kind === "signal");
@@ -1033,6 +1051,26 @@ describe("Godot resource (.tscn/.tres) symbol extraction", () => {
     const fighter = result.symbols.find((s) => s.name === "Fighter");
     expect(fighter).toBeDefined();
     expect(fighter?.typeName).toBe("script:res://scripts/Fighter.gd");
+  });
+
+  it("does not attach script assignments from later non-node sections to the previous node", () => {
+    const tscnSource = [
+      "[gd_scene load_steps=3 format=3]",
+      "",
+      '[ext_resource type="Script" path="res://scripts/Root.gd" id="1"]',
+      '[ext_resource type="Script" path="res://scripts/Wrong.gd" id="2"]',
+      "",
+      '[node name="Root" type="Node"]',
+      'script = ExtResource("1")',
+      "",
+      '[connection signal="ready" from="." to="." method="_on_ready"]',
+      'script = ExtResource("2")',
+    ].join("\n");
+
+    const result = extractSymbolsAndCalls(tscnSource, "godot-resource", ".tscn", "scenes/Root.tscn");
+    const root = result.symbols.find((s) => s.name === "Root");
+
+    expect(root?.typeName).toBe("script:res://scripts/Root.gd");
   });
 });
 
@@ -1807,6 +1845,39 @@ describe("GDScript regression tests for confirmed-working features (P6)", () => 
         const signalCall = result.rawCalls.find((c) => c.calleeName === "died");
         expect(signalCall).toBeDefined();
         expect(signalCall?.receiver).toBe("self");
+      });
+    });
+
+    skipIfNoParser("signal emission resolution", () => {
+      it("resolves signal.emit() with the raw signal name on repeated resolution", () => {
+        const source = [
+          "class_name Fighter",
+          "extends Node",
+          "",
+          "signal died",
+          "",
+          "func take_damage():",
+          "    died.emit()",
+          "",
+        ].join("\n");
+        const result = extractSymbolsAndCalls(source, "gdscript", ".gd", "scripts/Fighter.gd");
+        const symbolsByFile = new Map<string, SymbolNode[]>([["scripts/Fighter.gd", result.symbols]]);
+        const outgoingCallsByFile = new Map<string, SymbolEdge[]>([
+          ["scripts/Fighter.gd", rawCallsToUnresolvedEdges(result.rawCalls)],
+        ]);
+        const fileGraph: CodeGraph = {
+          nodes: [{ filePath: "scripts/Fighter.gd", relativePath: "scripts/Fighter.gd", imports: [], exports: [], dependencies: [], dependents: [] }],
+          edges: [],
+        };
+
+        resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile);
+        resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile);
+
+        const edge = outgoingCallsByFile.get("scripts/Fighter.gd")?.find((candidate) => candidate.signalEmit);
+        expect(edge?.calleeName).toBe("died");
+        expect(edge?.confidence).toBe("unique");
+        expect(edge?.calleeCandidates).toHaveLength(1);
+        expect(edge?.calleeCandidates[0]).toContain("Fighter.died");
       });
     });
 

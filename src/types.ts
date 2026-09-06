@@ -191,6 +191,9 @@ export interface SymbolEdge {
   /** Receiver expression for method calls (e.g. "fighter" in "fighter.take_damage()").
    *  Used by GDScript receiver-type resolution. Absent for bare function calls. */
   receiver?: string;
+  /** True when a GDScript call edge represents `signal_name.emit()`.
+   *  Optional so symbol graphs built before signal-edge support remain readable. */
+  signalEmit?: boolean;
 }
 
 /** Lightweight reference to a symbol (used by name index) */
