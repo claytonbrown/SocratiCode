@@ -669,3 +669,154 @@ export function detectExtensionlessExtension(contentHead: string): string | null
   if (shHits >= 2) return ".sh";
   return null;
 }
+
+// ── Godot builtins (for GDScript symbol resolution) ──────────────────────
+
+/**
+ * Godot engine classes that are always available without `class_name` or
+ * `preload`. When a receiver type resolves to one of these, the method call
+ * is a Godot engine API call — not a project symbol — and should be filtered
+ * from the unresolved callee list rather than counted against resolution %.
+ *
+ * Source: Godot 4.x class reference (finite, documented set).
+ */
+export const GODOT_BUILTIN_CLASSES = new Set<string>([
+  // Object hierarchy
+  "Object", "RefCounted", "Node", "CanvasItem", "Node2D", "Node3D",
+  "Control", "Window", "Viewport",
+  // 2D nodes
+  "Sprite2D", "AnimatedSprite2D", "Area2D", "CollisionObject2D",
+  "CharacterBody2D", "RigidBody2D", "StaticBody2D", "AnimatableBody2D",
+  "Camera2D", "Light2D", "LightOccluder2D", "Line2D", "Polygon2D",
+  "NavigationAgent2D", "NavigationObstacle2D", "Path2D", "PathFollow2D",
+  "RayCast2D", "ShapeCast2D", "TileMap", "TileMapLayer", "MultiMeshInstance2D",
+  "Skeleton2D", "Bone2D", "Marker2D", "RemoteTransform2D",
+  // 3D nodes
+  "Sprite3D", "AnimatedSprite3D", "Area3D", "CollisionObject3D",
+  "CharacterBody3D", "RigidBody3D", "StaticBody3D", "AnimatableBody3D",
+  "Camera3D", "Light3D", "DirectionalLight3D", "OmniLight3D", "SpotLight3D",
+  "MeshInstance3D", "MultiMeshInstance3D", "Skeleton3D", "BoneAttachment3D",
+  "RayCast3D", "ShapeCast3D", "NavigationAgent3D", "NavigationObstacle3D",
+  "Path3D", "PathFollow3D", "Marker3D", "RemoteTransform3D",
+  "VisibleOnScreenNotifier3D", "VisibleOnScreenEnabler3D",
+  // Resources
+  "Resource", "Shader", "ShaderMaterial", "StandardMaterial3D",
+  "ORMMaterial3D", "Texture", "Texture2D", "CompressedTexture2D",
+  "ImageTexture", "CanvasTexture", "ViewportTexture", "CurveTexture",
+  "GradientTexture", "NoiseTexture2D", "AnimatedTexture",
+  "Font", "FontFile", "FontVariation", "SystemFont", "Theme",
+  "AudioStream", "AudioStreamMP3", "AudioStreamOggVorbis", "AudioStreamWAV",
+  "Animation", "AnimationLibrary", "AnimationNode", "AnimationTree",
+  "AnimationPlayer", "Tween", "SceneTreeTimer",
+  "PackedScene", "JSON", "ConfigFile", "Settings",
+  "InputEvent", "InputEventKey", "InputEventMouseButton",
+  "InputEventAction", "InputEventJoypadMotion", "InputEventJoypadButton",
+  "InputEventScreenTouch", "InputEventScreenDrag", "InputEventMagnifyGesture",
+  "InputEventPanGesture",
+  // Math types
+  "Vector2", "Vector2i", "Vector3", "Vector3i", "Vector4", "Vector4i",
+  "Rect2", "Rect2i", "AABB", "Transform2D", "Transform3D", "Basis",
+  "Quaternion", "Projection", "Plane", "Color", "RID",
+  // Collections
+  "Array", "PackedByteArray", "PackedInt32Array", "PackedInt64Array",
+  "PackedFloat32Array", "PackedFloat64Array", "PackedStringArray",
+  "PackedVector2Array", "PackedVector3Array", "PackedColorArray",
+  "Dictionary",
+  // Other
+  "String", "StringName", "NodePath", "Callable", "Signal",
+  "Variant", "bool", "int", "float", "Nil",
+  // Engine singletons (static classes accessible from any script)
+  "Engine", "OS", "Time", "ClassDB", "EngineDebugger", "GDExtensionManager",
+  "IP", "Marshalls", "ResourceLoader", "ResourceSaver", "WorkerThreadPool",
+  "PhysicsServer2D", "PhysicsServer3D", "RenderingServer", "AudioServer",
+  "NavigationServer2D", "NavigationServer3D", "TranslationServer",
+  "DisplayServer", "Input", "InputMap", "ProjectSettings",
+  "MainLoop", "SceneTree",
+  "Performance", "ResourceUID", "Geometry2D", "Geometry3D",
+  "TextServerManager", "ThemeDB", "XRServer", "CameraServer",
+  "NavigationMeshGenerator", "NativeMenu", "AccessibilityServer",
+  "NavigationServer2DManager", "NavigationServer3DManager",
+  "PhysicsServer2DManager", "PhysicsServer3DManager",
+  "GDScriptLanguageProtocol", "JavaClassWrapper", "JavaScriptBridge",
+  "EditorInterface",
+  // Network
+  "HTTPRequest", "WebSocketPeer", "TCPServer", "TCP_Server",
+  "UDPServer", "PacketPeer", "StreamPeer", "StreamPeerBuffer",
+  "StreamPeerTCP", "StreamPeerTLS", "TLSOptions",
+  "XMLParser", "RegEx", "DirAccess", "FileAccess",
+]);
+
+/**
+ * Godot built-in utility functions available in any GDScript context without
+ * import or class prefix. Calls to these should not count against resolution %.
+ *
+ * Source: Godot 4.x @GlobalScope utility functions.
+ */
+export const GODOT_BUILTIN_FUNCTIONS = new Set<string>([
+  "print", "print_rich", "printerr", "printraw", "print_verbose",
+  "prints", "printt", "push_error", "push_warning",
+  "str", "str_to_var", "var_to_str", "var_to_str_with_objects",
+  "range", "len", "is_instance_valid", "is_instance_of",
+  "load", "preload", "ResourceLoader_load",
+  // Math: min/max/clamp
+  "min", "max", "clamp", "clampi", "clampf",
+  "mini", "maxi", "minf", "maxf",
+  // Math: rounding
+  "snapped", "snappedi", "snappedf",
+  "floor", "floorf", "floori", "ceil", "ceilf", "ceili",
+  "round", "roundf", "roundi",
+  "abs", "absf", "absi", "sign", "signf", "signi",
+  // Math: interpolation
+  "lerp", "lerpf", "lerp_angle", "inverse_lerp", "range_lerp",
+  "remap", "smoothstep", "move_toward", "damp", "dampf",
+  "cubic_interpolate", "cubic_interpolate_angle",
+  "cubic_interpolate_angle_in_time", "cubic_interpolate_in_time",
+  "bezier_derivative", "bezier_interpolate",
+  "rotate_toward", "angle_difference",
+  // Math: trig
+  "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+  "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+  // Math: power/log
+  "pow", "sqrt", "exp", "log",
+  "ease", "step_decimals", "nearest_po2",
+  // Math: modular
+  "fmod", "fposmod", "posmod", "pingpong", "wrap", "wrapf", "wrapi",
+  // Math: conversion
+  "deg_to_rad", "rad_to_deg", "linear_to_db", "db_to_linear",
+  // Math: comparison
+  "is_equal_approx", "is_zero_approx", "is_finite", "is_nan",
+  // Random
+  "randf", "randi", "randf_range", "randi_range", "randfn",
+  "randomize", "rand_from_seed", "rand_seed", "seed",
+  // Type / introspection
+  "typeof", "type_string", "type_exists", "instance_from_id",
+  "weakref", "funcref", "convert", "hash", "Color",
+  "error_string", "bytes_to_var", "bytes_to_var_with_objects",
+  "is_same", "type_convert",
+  // RID allocation
+  "rid_allocate", "rid_get_id",
+  // Constructors (builtin types)
+  "Vector2", "Vector2i", "Vector3", "Vector3i",
+  "Rect2", "Rect2i", "Transform2D", "Transform3D",
+  "Quaternion", "Basis", "AABB", "Plane", "Projection",
+  "Callable", "Signal", "Dictionary", "Array",
+  "PackedByteArray", "PackedInt32Array", "PackedInt64Array",
+  "PackedFloat32Array", "PackedFloat64Array", "PackedStringArray",
+  "PackedVector2Array", "PackedVector3Array", "PackedColorArray",
+  "String", "StringName", "NodePath", "RID",
+  // Signal / deferred (Object methods commonly called with implicit self)
+  "emit_signal", "set_deferred", "call_deferred",
+  // Control flow
+  "assert", "breakpoint", "yield", "await",
+  // Node methods commonly called with implicit self in GDScript scripts
+  // (e.g. `get_node("Player")` inside a Node script is `self.get_node(...)`)
+  // These are NOT @GlobalScope functions, but filtering them avoids false
+  // unresolved noise since the AST sees them as bare calls without a receiver.
+  "get_node", "get_node_or_null", "get_tree", "get_viewport",
+  "find_child", "find_parent", "has_node",
+  "add_child", "remove_child",
+  "get_child", "get_children", "get_parent",
+  "is_inside_tree",
+  "queue_free", "free",
+  "connect", "disconnect", "is_connected",
+]);

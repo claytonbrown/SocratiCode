@@ -111,7 +111,9 @@ export type SymbolKind =
   | "module"
   | "struct"
   | "type"
-  | "variable";
+  | "variable"
+  | "signal"
+  | "constant";
 
 /** A single symbol (definition) extracted from source code */
 export interface SymbolNode {
@@ -133,6 +135,9 @@ export interface SymbolNode {
   /** Whether the symbol is exported from its containing module */
   isExported?: boolean;
   language: string;
+  /** Type annotation for typed variables (GDScript `var x: Fighter`).
+   *  Used by receiver-type resolution to resolve `x.method()` → `Fighter.method()`. */
+  typeName?: string;
 }
 
 /** Kind of relationship an edge represents */
@@ -148,7 +153,8 @@ export type SymbolEdgeConfidence =
   | "local"
   | "unique"
   | "multiple-candidates"
-  | "unresolved";
+  | "unresolved"
+  | "engine"; // Godot engine API call — not a project symbol, excluded from unresolved %
 
 /** A call-site edge between symbols */
 export interface SymbolEdge {
@@ -170,6 +176,9 @@ export interface SymbolEdge {
    */
   localAlias?: string;
   callSite: { file: string; line: number };
+  /** Receiver expression for method calls (e.g. "fighter" in "fighter.take_damage()").
+   *  Used by GDScript receiver-type resolution. Absent for bare function calls. */
+  receiver?: string;
 }
 
 /** Lightweight reference to a symbol (used by name index) */

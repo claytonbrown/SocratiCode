@@ -75,7 +75,7 @@ export interface VizSymbol {
 export interface VizSymbolEdge {
   source: string;  // symbol id
   target: string;  // symbol id (first candidate)
-  confidence: "unique" | "multiple-candidates" | "local" | "unresolved";
+  confidence: "unique" | "multiple-candidates" | "local" | "unresolved" | "engine";
 }
 
 export interface VizData {
