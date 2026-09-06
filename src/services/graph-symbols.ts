@@ -2983,6 +2983,7 @@ function extractFromGdscript(
         line: startLine,
         endLine,
         language,
+        isGdscriptClassName: true,
       };
       symbols.push(sym);
       scopes.push({ name: cn, startLine, endLine, symbolId: sym.id });

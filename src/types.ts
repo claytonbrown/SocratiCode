@@ -138,6 +138,8 @@ export interface SymbolNode {
   /** Type annotation for typed variables (GDScript `var x: Fighter`).
    *  Used by receiver-type resolution to resolve `x.method()` → `Fighter.method()`. */
   typeName?: string;
+  /** True only for a GDScript `class_name` declaration, never an inner class. */
+  isGdscriptClassName?: boolean;
 }
 
 /** Kind of relationship an edge represents */

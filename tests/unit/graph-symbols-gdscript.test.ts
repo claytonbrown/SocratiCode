@@ -71,6 +71,7 @@ describe("GDScript symbol extraction (AST-based)", () => {
       expect(classSym).toBeDefined();
       expect(classSym?.name).toBe("Fighter");
       expect(classSym?.qualifiedName).toBe("Fighter");
+      expect(classSym?.isGdscriptClassName).toBe(true);
     });
 
     it("extracts functions as methods when class_name is present", () => {
@@ -231,6 +232,7 @@ describe("GDScript symbol extraction (AST-based)", () => {
       const innerClass = result.symbols.find((s) => s.kind === "class" && s.name === "Inner");
       expect(innerClass).toBeDefined();
       expect(innerClass?.qualifiedName).toBe("Fighter.Inner");
+      expect(innerClass?.isGdscriptClassName).toBeUndefined();
 
       // Inner class method — qualified with Inner, not Fighter
       const innerMethod = result.symbols.find((s) => s.name === "inner_method");
@@ -1139,6 +1141,73 @@ describe("GDScript assignment-site type inference", () => {
       expect(edge).toBeDefined();
       expect(edge?.confidence).toBe("unique");
       expect(edge?.calleeCandidates[0]).toContain("Fighter.attack");
+    });
+
+    it("does not treat an inner class as class_name ownership", () => {
+      const source = [
+        "extends Node",
+        "",
+        "class State:",
+        "    pass",
+        "",
+        "func setup():",
+        "    var clone = self",
+        "    clone.project_only()",
+        "",
+      ].join("\n");
+
+      const result = extractSymbolsAndCalls(source, "gdscript", ".gd", "scripts/Anonymous.gd");
+      const symbolsByFile = new Map<string, SymbolNode[]>([["scripts/Anonymous.gd", result.symbols]]);
+      const outgoingCallsByFile = new Map<string, SymbolEdge[]>([
+        ["scripts/Anonymous.gd", rawCallsToUnresolvedEdges(result.rawCalls)],
+      ]);
+      const inferredTypesByFile = new Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>();
+      if (result.inferredTypes) inferredTypesByFile.set("scripts/Anonymous.gd", result.inferredTypes);
+      const fileGraph: CodeGraph = {
+        nodes: [{
+          filePath: "scripts/Anonymous.gd",
+          relativePath: "scripts/Anonymous.gd",
+          imports: [],
+          exports: [],
+          dependencies: [],
+          dependents: [],
+          language: "gdscript",
+        }],
+        edges: [],
+      };
+      const projectRoot = "/godot-project";
+
+      resolveCallSites(
+        fileGraph,
+        symbolsByFile,
+        outgoingCallsByFile,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        inferredTypesByFile,
+        undefined,
+        undefined,
+        {
+          projectRootByFile: new Map([["scripts/Anonymous.gd", projectRoot]]),
+          projectsByRoot: new Map([[
+            projectRoot,
+            {
+              rootOffset: "",
+              classNameIndex: new Map(),
+              autoloadTable: new Map(),
+            },
+          ]]),
+        },
+      );
+
+      const innerClass = result.symbols.find((symbol) => symbol.name === "State");
+      const edge = outgoingCallsByFile.get("scripts/Anonymous.gd")?.find((call) => call.calleeName === "project_only");
+      expect(innerClass?.isGdscriptClassName).toBeUndefined();
+      expect(edge?.confidence).toBe("unresolved");
+      expect(edge?.calleeCandidates).toEqual([]);
     });
 
     it("infers type from bare assignment x = ClassName.new()", () => {

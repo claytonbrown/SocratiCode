@@ -48,6 +48,8 @@ export interface GodotSymbolResolutionContext {
   projectsByRoot: ReadonlyMap<string, GodotSymbolProject>;
 }
 
+type GdscriptSceneEntry = readonly [file: string, symbols: Map<string, SymbolNode[]>];
+
 /** Normalize relative path components like `foo/../bar` -> `bar` */
 function normalizePath(p: string): string {
   const parts = p.split("/").filter(Boolean);
@@ -306,13 +308,12 @@ export function resolveCallSites(
     if (node.language) langByFile.set(node.relativePath, node.language);
   }
 
-  // Build the legacy unscoped class_name → file index from top-level class
+  // Build the legacy unscoped class_name → file index from explicit class_name
   // symbols only. Direct callers that do not supply Godot project metadata
   // retain the original single-project behaviour. Full graph builds supply
   // `godotContext` and select a project-local index for each caller below.
-  // Inner classes (qualifiedName !== name, e.g. "Fighter.State") must NOT
-  // pollute the global index — their bare names (State, Data, Item) would
-  // hijack entries for actual top-level classes with the same name.
+  // A script without class_name can contain an inner class whose qualified and
+  // unqualified names match, so name shape alone cannot identify ownership.
   const classNameIndex = new Map<string, string>();
   // Build res:// script path → class_name index for .tscn script resolution.
   // Maps "scripts/Fighter.gd" → "Fighter" so that .tscn nodes with
@@ -321,7 +322,7 @@ export function resolveCallSites(
   const scriptPathToClassName = new Map<string, string>();
   for (const [file, syms] of symbolsByFile.entries()) {
     for (const s of syms) {
-      if (s.kind === "class" && s.qualifiedName === s.name) {
+      if (s.kind === "class" && s.isGdscriptClassName === true) {
         classNameIndex.set(s.name, s.file);
         // Also map the file path (without res://) to the class name
         scriptPathToClassName.set(file, s.name);
@@ -348,6 +349,35 @@ export function resolveCallSites(
     return godotProjectForFile(file)?.autoloadTable ?? emptyAutoloadTable;
   };
 
+  // Receiver resolution can consult scenes twice for every edge. Cache the
+  // project-filtered entries once, then preserve same-directory precedence
+  // with a stable partition once per caller instead of rescanning and sorting
+  // the complete symbol index for every fallback.
+  const sceneEntriesByProject = new Map<string | undefined, GdscriptSceneEntry[]>();
+  const sceneEntriesForProject = (projectRoot: string | undefined): GdscriptSceneEntry[] => {
+    const cached = sceneEntriesByProject.get(projectRoot);
+    if (cached) return cached;
+    const entries: GdscriptSceneEntry[] = [...symbolIndexByFile.entries()].filter(([file]) => {
+      if (!file.endsWith(".tscn") && !file.endsWith(".tres")) return false;
+      if (!godotContext) return true;
+      return projectRoot !== undefined && godotContext.projectRootByFile.get(file) === projectRoot;
+    });
+    sceneEntriesByProject.set(projectRoot, entries);
+    return entries;
+  };
+  const sceneEntriesForCaller = (
+    callerFile: string,
+    projectRoot: string | undefined,
+  ): GdscriptSceneEntry[] => {
+    const callerDir = callerFile.substring(0, callerFile.lastIndexOf("/") + 1);
+    const sameDirectory: GdscriptSceneEntry[] = [];
+    const otherDirectories: GdscriptSceneEntry[] = [];
+    for (const entry of sceneEntriesForProject(projectRoot)) {
+      (entry[0].startsWith(callerDir) ? sameDirectory : otherDirectories).push(entry);
+    }
+    return [...sameDirectory, ...otherDirectories];
+  };
+
   // Build file → Map<variableName, typeName> for typed variable lookup
   const typedVarsByFile = new Map<string, Map<string, string>>();
   for (const [file, syms] of symbolsByFile.entries()) {
@@ -364,7 +394,7 @@ export function resolveCallSites(
   const classNameByFile = new Map<string, string>();
   for (const [file, syms] of symbolsByFile.entries()) {
     for (const s of syms) {
-      if (s.kind === "class") {
+      if (s.kind === "class" && s.isGdscriptClassName === true) {
         classNameByFile.set(file, s.name);
         break;
       }
@@ -1213,20 +1243,23 @@ export function resolveCallSites(
     const callerMemberTypeTable = godotContext
       ? (callerGodotRoot ? memberTypeTablesByRoot.get(callerGodotRoot) : undefined)
       : memberTypeTable;
+    const callerLang = langByFile.get(callerFile)
+      ?? symbolsByFile.get(callerFile)?.find((s) => s.language)?.language;
+    const isGdscript = callerLang === "gdscript";
+    let cachedCallerSceneEntries: GdscriptSceneEntry[] | undefined;
+    const getCallerSceneEntries = (): readonly GdscriptSceneEntry[] => {
+      cachedCallerSceneEntries ??= sceneEntriesForCaller(callerFile, callerGodotRoot);
+      return cachedCallerSceneEntries;
+    };
 
     for (const edge of edges) {
-      // Determine if this is a GDScript file (for Godot-specific resolution)
-      const callerLang = langByFile.get(callerFile)
-        ?? symbolsByFile.get(callerFile)?.find((s) => s.language)?.language;
       const callLine = edge.callSite.line;
-      const isGdscript = callerLang === "gdscript";
 
       // ── GDScript receiver-type resolution ───────────────────────────
       if (isGdscript && edge.receiver) {
         const resolved = resolveGdscriptReceiverCall(
           edge.receiver,
           edge.calleeName,
-          callerFile,
           callerAutoloadTable,
           callerClassNameIndex,
           localVars,
@@ -1239,9 +1272,8 @@ export function resolveCallSites(
           scriptPathToClassName,
           callLine,
           resToRepoPathMap,
-          godotContext?.projectRootByFile,
-          callerGodotRoot,
           callerGodotProject?.rootOffset,
+          getCallerSceneEntries,
         );
         if (resolved !== null) {
           if (resolved.length > 0) {
@@ -1513,7 +1545,6 @@ function resolveTypeMarker(
 function resolveGdscriptReceiverCall(
   receiver: string,
   methodName: string,
-  _callerFile: string,
   autoloadTable: ReadonlyMap<string, string> | undefined,
   classNameIndex: ReadonlyMap<string, string>,
   localVars: Map<string, string> | undefined,
@@ -1526,24 +1557,14 @@ function resolveGdscriptReceiverCall(
   scriptPathToClassName?: Map<string, string>,
   callLine?: number,
   resToRepoPathMap?: Map<string, string>,
-  projectRootByFile?: ReadonlyMap<string, string>,
-  callerProjectRoot?: string,
   godotRootOffset?: string,
+  getSceneEntries: () => readonly GdscriptSceneEntry[] = () => [],
 ): string[] | null {
-  // Directory prefix of the caller file, used to prefer scene files in the
-  // same Godot project when resolving $NodePath fallbacks.
-  const callerDir = _callerFile ? _callerFile.substring(0, _callerFile.lastIndexOf("/") + 1) : "";
-
   const repoPathForResource = (resourcePath: string): string => {
     if (godotRootOffset !== undefined) {
       return godotRootOffset ? `${godotRootOffset}/${resourcePath}` : resourcePath;
     }
     return resToRepoPathMap?.get(resourcePath) ?? resourcePath;
-  };
-
-  const isSceneInCallerProject = (file: string): boolean => {
-    if (!projectRootByFile) return true;
-    return callerProjectRoot !== undefined && projectRootByFile.get(file) === callerProjectRoot;
   };
 
   // A project class_name always wins over a Godot builtin of the same name.
@@ -1578,12 +1599,12 @@ function resolveGdscriptReceiverCall(
     for (const dep of callerDeps) {
       const depIdx = symbolIndexByFile.get(dep);
       if (!depIdx) continue;
-      // Skip deps that don't have a top-level class — they're likely
+      // Skip deps that don't have a class_name declaration — they're likely
       // preload/load targets, not the extends parent.
-      const hasTopLevelClass = Array.from(depIdx.values()).some(
-        (syms) => syms.some((s) => s.kind === "class" && s.qualifiedName === s.name),
+      const hasClassName = Array.from(depIdx.values()).some(
+        (syms) => syms.some((s) => s.kind === "class" && s.isGdscriptClassName === true),
       );
-      if (!hasTopLevelClass) continue;
+      if (!hasClassName) continue;
       const matches = depIdx.get(methodName);
       if (!matches || matches.length === 0) continue;
       const methodMatches = matches.filter((s) => s.kind === "method" || s.kind === "function" || s.kind === "constructor");
@@ -1650,16 +1671,7 @@ function resolveGdscriptReceiverCall(
     // project) to avoid resolving to a node of the same name in a different scene.
     if (!currentType) {
       const nodeName = firstPart.includes("/") ? (firstPart.split("/").pop() ?? firstPart) : firstPart;
-      const sceneEntries = [...symbolIndexByFile.entries()]
-        .filter(([fp]) =>
-          (fp.endsWith(".tscn") || fp.endsWith(".tres")) && isSceneInCallerProject(fp)
-        )
-        .sort(([a], [b]) => {
-          const aSameDir = a.startsWith(callerDir) ? 0 : 1;
-          const bSameDir = b.startsWith(callerDir) ? 0 : 1;
-          return aSameDir - bSameDir;
-        });
-      for (const [, fileIdx] of sceneEntries) {
+      for (const [, fileIdx] of getSceneEntries()) {
         const nodeSyms = fileIdx.get(nodeName);
         if (!nodeSyms || nodeSyms.length === 0) continue;
         const nodeSym = nodeSyms[0];
@@ -1809,16 +1821,7 @@ function resolveGdscriptReceiverCall(
     // Prefer scene files in the same directory as the caller (same Godot
     // project) to avoid resolving to a node of the same name in a different scene.
     const nodeName = receiver.includes("/") ? (receiver.split("/").pop() ?? receiver) : receiver;
-    const sceneEntries = [...symbolIndexByFile.entries()]
-      .filter(([fp]) =>
-        (fp.endsWith(".tscn") || fp.endsWith(".tres")) && isSceneInCallerProject(fp)
-      )
-      .sort(([a], [b]) => {
-        const aSameDir = a.startsWith(callerDir) ? 0 : 1;
-        const bSameDir = b.startsWith(callerDir) ? 0 : 1;
-        return aSameDir - bSameDir;
-      });
-    for (const [, fileIdx] of sceneEntries) {
+    for (const [, fileIdx] of getSceneEntries()) {
       const nodeSyms = fileIdx.get(nodeName);
       if (!nodeSyms || nodeSyms.length === 0) continue;
       const nodeSym = nodeSyms[0];
