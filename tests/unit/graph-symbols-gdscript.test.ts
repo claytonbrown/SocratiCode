@@ -2049,10 +2049,12 @@ describe("GDScript permanent regression contracts", () => {
       const nestedEdge = built.outgoingCallsByFile.get("nested/scripts/Caller.gd")?.find(
         (edge) => edge.calleeName === "ping",
       );
+      expect(rootEdge?.confidence).toBe("unique");
       expect(rootEdge?.calleeCandidates).toEqual([
         expect.stringContaining("scripts/Shared.gd::Shared.ping"),
       ]);
       expect(rootEdge?.calleeCandidates[0]).not.toContain("nested/");
+      expect(nestedEdge?.confidence).toBe("unique");
       expect(nestedEdge?.calleeCandidates).toEqual([
         expect.stringContaining("nested/scripts/Shared.gd::Shared.ping"),
       ]);
