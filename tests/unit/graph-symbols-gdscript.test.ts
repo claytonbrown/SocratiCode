@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { ensureDynamicLanguages, gdscriptParserAvailable } from "../../src/services/code-graph.js";
+import { buildCodeGraph, ensureDynamicLanguages, gdscriptParserAvailable } from "../../src/services/code-graph.js";
 import { parseGodotAutoloads } from "../../src/services/graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "../../src/services/graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "../../src/services/graph-symbols.js";
@@ -645,7 +645,17 @@ describe("GDScript receiver-type resolution", () => {
       };
 
       const autoloadTable = new Map([["GameManager", "scripts/core/GameManager.gd"]]);
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, autoloadTable);
+      resolveCallSites(
+        fileGraph,
+        symbolsByFile,
+        outgoingCallsByFile,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        autoloadTable,
+      );
 
       const edge = outgoingCallsByFile.get("scripts/Battle.gd")?.find((e) => e.calleeName === "start_match");
       expect(edge).toBeDefined();
@@ -1057,7 +1067,7 @@ describe("GDScript assignment-site type inference", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile);
 
       // f = Fighter.new() → f has type Fighter → f.take_damage() resolves
       const edge = outgoingCallsByFile.get("scripts/Combat.gd")?.find((e) => e.calleeName === "take_damage");
@@ -1084,7 +1094,7 @@ describe("GDScript assignment-site type inference", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile);
 
       // clone = self → clone has type Fighter → clone.attack() resolves
       const edge = outgoingCallsByFile.get("scripts/Fighter.gd")?.find((e) => e.calleeName === "attack");
@@ -1120,7 +1130,7 @@ describe("GDScript assignment-site type inference", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile);
 
       // f = Fighter.new() → f has type Fighter → f.take_damage() resolves
       const edge = outgoingCallsByFile.get("scripts/Combat.gd")?.find((e) => e.calleeName === "take_damage");
@@ -1167,7 +1177,7 @@ describe("GDScript assignment-site type inference", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile, memberAssignmentsByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile, memberAssignmentsByFile);
 
       // state.state_machine = StateMachine.new() in Fighter.gd
       // → State.state_machine has type StateMachine
@@ -1210,7 +1220,7 @@ describe("GDScript assignment-site type inference", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile);
 
       // Declared type is Node (builtin), but assignment infers Fighter.
       // P2 narrowing should prefer Fighter → take_damage resolves.
@@ -1348,7 +1358,7 @@ describe("GDScript builtin/engine whitelist completeness (P4)", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile);
 
       const edge = outgoingCallsByFile.get("scripts/Test.gd")?.find((e) => e.calleeName === "is_empty");
       expect(edge).toBeDefined();
@@ -1372,7 +1382,7 @@ describe("GDScript builtin/engine whitelist completeness (P4)", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile);
 
       const edge = outgoingCallsByFile.get("scripts/Test.gd")?.find((e) => e.calleeName === "keys");
       expect(edge).toBeDefined();
@@ -1477,7 +1487,7 @@ describe("GDScript typed multi-hop chains (P5)", () => {
         edges: [],
       };
 
-      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, inferredTypesByFile);
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile, undefined, undefined, undefined, undefined, undefined, undefined, inferredTypesByFile);
 
       // f is inferred as Fighter (from `var f: Fighter = self`)
       // f.state → State (typed member of Fighter)
@@ -1838,6 +1848,216 @@ describe("GDScript regression tests for confirmed-working features (P6)", () => 
 // must resolve through the actual extends parent even without class_name.
 describe("GDScript permanent regression contracts", () => {
   const skipIfNoParser = gdscriptParserAvailable ? describe : describe.skip;
+
+  skipIfNoParser("declaration and assignment boundaries", () => {
+    it("does not infer a declaration type from a nested lambda parameter", () => {
+      const result = extractSymbolsAndCalls(
+        [
+          "var callback = func(value: Fighter):",
+          "    return value",
+          "const CALLBACK = func(value: Fighter):",
+          "    return value",
+        ].join("\n"),
+        "gdscript",
+        ".gd",
+        "scripts/Callbacks.gd",
+      );
+
+      expect(result.symbols.find((symbol) => symbol.name === "callback")).toBeUndefined();
+      expect(result.symbols.find((symbol) => symbol.name === "CALLBACK")?.typeName).toBeUndefined();
+    });
+
+    it("records only direct receiver.member assignments", () => {
+      const result = extractSymbolsAndCalls(
+        [
+          "func configure() -> void:",
+          "    direct.member = Fighter.new()",
+          "    nested.owner.member = Fighter.new()",
+        ].join("\n"),
+        "gdscript",
+        ".gd",
+        "scripts/Assignments.gd",
+      );
+
+      expect(result.memberAssignments).toEqual([
+        { receiver: "direct", memberName: "member", valueType: "Fighter" },
+      ]);
+    });
+  });
+
+  skipIfNoParser("explicit constructor calls", () => {
+    it("resolves _init on a typed project receiver", () => {
+      const target = extractSymbolsAndCalls(
+        [
+          "class_name Fighter",
+          "extends RefCounted",
+          "func _init() -> void:",
+          "    pass",
+        ].join("\n"),
+        "gdscript",
+        ".gd",
+        "scripts/Fighter.gd",
+      );
+      const caller = extractSymbolsAndCalls(
+        [
+          "extends Node",
+          "var fighter: Fighter",
+          "func reset() -> void:",
+          "    fighter._init()",
+        ].join("\n"),
+        "gdscript",
+        ".gd",
+        "scripts/Caller.gd",
+      );
+      const symbolsByFile = new Map<string, SymbolNode[]>([
+        ["scripts/Fighter.gd", target.symbols],
+        ["scripts/Caller.gd", caller.symbols],
+      ]);
+      const outgoingCallsByFile = new Map<string, SymbolEdge[]>([
+        ["scripts/Caller.gd", rawCallsToUnresolvedEdges(caller.rawCalls)],
+      ]);
+      const fileGraph: CodeGraph = {
+        nodes: [
+          { filePath: "scripts/Fighter.gd", relativePath: "scripts/Fighter.gd", imports: [], exports: [], dependencies: [], dependents: ["scripts/Caller.gd"], language: "gdscript" },
+          { filePath: "scripts/Caller.gd", relativePath: "scripts/Caller.gd", imports: [], exports: [], dependencies: ["scripts/Fighter.gd"], dependents: [], language: "gdscript" },
+        ],
+        edges: [],
+      };
+
+      resolveCallSites(fileGraph, symbolsByFile, outgoingCallsByFile);
+
+      const edge = outgoingCallsByFile.get("scripts/Caller.gd")?.find(
+        (candidate) => candidate.calleeName === "_init",
+      );
+      expect(edge?.confidence).toBe("unique");
+      expect(edge?.calleeCandidates).toEqual([
+        expect.stringContaining("scripts/Fighter.gd::Fighter._init"),
+      ]);
+    });
+  });
+
+  skipIfNoParser("Godot project isolation", () => {
+    it("retains single-directory resolution when project.godot is absent", async () => {
+      const root = mkTempDir("gdscript-symbols-no-project-");
+      fs.writeFileSync(
+        path.join(root, "Target.gd"),
+        [
+          "class_name Target",
+          "extends Node",
+          "func ping() -> void:",
+          "    pass",
+        ].join("\n"),
+      );
+      fs.writeFileSync(
+        path.join(root, "Caller.gd"),
+        [
+          "extends Node",
+          "var target: Target",
+          "func run() -> void:",
+          "    target.ping()",
+        ].join("\n"),
+      );
+
+      const built = await buildCodeGraph(root);
+      expect(built.godotContext).toBeUndefined();
+      resolveCallSites(
+        { nodes: built.nodes, edges: built.edges },
+        built.symbolsByFile,
+        built.outgoingCallsByFile,
+        built.rustBindingsByFile,
+        built.rustCrateRootByFile,
+        built.rustInlineScopedCalls,
+        built.rustInlineDeclaredSymbols,
+        built.rustCrateRootsByFile,
+        built.autoloadTable,
+        built.inferredTypesByFile,
+        built.memberAssignmentsByFile,
+        built.resToRepoPathMap,
+        built.godotContext,
+      );
+
+      const edge = built.outgoingCallsByFile.get("Caller.gd")?.find(
+        (candidate) => candidate.calleeName === "ping",
+      );
+      expect(edge?.confidence).toBe("unique");
+      expect(edge?.calleeCandidates).toEqual([
+        expect.stringContaining("Target.gd::Target.ping"),
+      ]);
+    });
+
+    it("resolves duplicate autoload and class names within each caller's nearest project", async () => {
+      const root = writeGodotProject(
+        {
+          "scripts/Shared.gd": [
+            "class_name Shared",
+            "extends Node",
+            "func ping() -> void:",
+            "    pass",
+          ].join("\n"),
+          "scripts/Caller.gd": [
+            "extends Node",
+            "func run() -> void:",
+            "    Shared.ping()",
+          ].join("\n"),
+        },
+        { Shared: "scripts/Shared.gd" },
+      );
+      const nestedRoot = path.join(root, "nested");
+      fs.mkdirSync(path.join(nestedRoot, "scripts"), { recursive: true });
+      fs.writeFileSync(
+        path.join(nestedRoot, "project.godot"),
+        '[autoload]\nShared="*res://scripts/Shared.gd"\n',
+      );
+      fs.writeFileSync(
+        path.join(nestedRoot, "scripts/Shared.gd"),
+        [
+          "class_name Shared",
+          "extends Node",
+          "func ping() -> void:",
+          "    pass",
+        ].join("\n"),
+      );
+      fs.writeFileSync(
+        path.join(nestedRoot, "scripts/Caller.gd"),
+        [
+          "extends Node",
+          "func run() -> void:",
+          "    Shared.ping()",
+        ].join("\n"),
+      );
+
+      const built = await buildCodeGraph(root);
+      resolveCallSites(
+        { nodes: built.nodes, edges: built.edges },
+        built.symbolsByFile,
+        built.outgoingCallsByFile,
+        built.rustBindingsByFile,
+        built.rustCrateRootByFile,
+        built.rustInlineScopedCalls,
+        built.rustInlineDeclaredSymbols,
+        built.rustCrateRootsByFile,
+        built.autoloadTable,
+        built.inferredTypesByFile,
+        built.memberAssignmentsByFile,
+        built.resToRepoPathMap,
+        built.godotContext,
+      );
+
+      const rootEdge = built.outgoingCallsByFile.get("scripts/Caller.gd")?.find(
+        (edge) => edge.calleeName === "ping",
+      );
+      const nestedEdge = built.outgoingCallsByFile.get("nested/scripts/Caller.gd")?.find(
+        (edge) => edge.calleeName === "ping",
+      );
+      expect(rootEdge?.calleeCandidates).toEqual([
+        expect.stringContaining("scripts/Shared.gd::Shared.ping"),
+      ]);
+      expect(rootEdge?.calleeCandidates[0]).not.toContain("nested/");
+      expect(nestedEdge?.calleeCandidates).toEqual([
+        expect.stringContaining("nested/scripts/Shared.gd::Shared.ping"),
+      ]);
+    });
+  });
 
   skipIfNoParser("project class_name shadows Godot builtin class (Fix D)", () => {
     it("resolves calls on a project class named Timer to the project symbol, not engine", () => {

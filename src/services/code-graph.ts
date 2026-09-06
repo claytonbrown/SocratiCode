@@ -18,9 +18,18 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotProjectRootForProject, findGodotRootForFile, parseGodotAutoloads, pythonRootsForFile, resolveImport, type GodotUidIndex } from "./graph-resolution.js";
-import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
-import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotProjectRootForProject, findGodotRootForFile, type GodotUidIndex, parseGodotAutoloads, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import {
+  computeUnresolvedPct,
+  type GodotSymbolResolutionContext,
+  resolveCallSites,
+} from "./graph-symbol-resolution.js";
+import {
+  extractSymbolsAndCalls,
+  type RustUseBinding,
+  rawCallsToUnresolvedEdges,
+} from "./graph-symbols.js";
+
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { logger } from "./logger.js";
 import { setGdscriptParserAvailable } from "./parser-availability.js";
@@ -251,7 +260,21 @@ async function doRebuildGraph(
         progress.phase = "resolving symbols";
         // Use the autoload table built by buildCodeGraph (per-project, merged
         // from all Godot project roots) for GDScript receiver-type resolution.
-        resolveCallSites(graph, built.symbolsByFile, built.outgoingCallsByFile, built.autoloadTable, built.inferredTypesByFile, built.memberAssignmentsByFile, built.resToRepoPathMap);
+        resolveCallSites(
+          graph,
+          built.symbolsByFile,
+          built.outgoingCallsByFile,
+          built.rustBindingsByFile,
+          built.rustCrateRootByFile,
+          built.rustInlineScopedCalls,
+          built.rustInlineDeclaredSymbols,
+          built.rustCrateRootsByFile,
+          built.autoloadTable,
+          built.inferredTypesByFile,
+          built.memberAssignmentsByFile,
+          built.resToRepoPathMap,
+          built.godotContext,
+        );
 
         progress.phase = "persisting symbols";
         await persistSymbolGraph(projectId, resolvedPath, built.symbolsByFile, built.outgoingCallsByFile);
@@ -923,8 +946,27 @@ export async function buildCodeGraph(
   outgoingCallsByFile: Map<string, SymbolEdge[]>;
   autoloadTable?: Map<string, string>;
   resToRepoPathMap: Map<string, string>;
+  godotContext?: GodotSymbolResolutionContext;
   inferredTypesByFile: Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>;
   memberAssignmentsByFile: Map<string, Array<{ receiver: string; memberName: string; valueType: string }>>;
+  /** Rust `use` bindings per file — resolution input only, never persisted. */
+  rustBindingsByFile: Map<string, RustUseBinding[]>;
+  /** Rust file → its crate's directory prefix. Resolution input only. */
+  rustCrateRootByFile: Map<string, string>;
+  /** Rust file → every target root its parsed Cargo manifest declares. */
+  rustCrateRootsByFile: Map<string, string[]>;
+  /**
+   * The call edges whose qualifier is rooted in an inline `mod` — a scope with
+   * no file to name. Resolution leaves them unresolved. Held by identity, so
+   * nothing about it reaches an edge or the store.
+   */
+  rustInlineScopedCalls: Set<SymbolEdge>;
+  /**
+   * The ids of the Rust symbols declared inside an inline `mod`. A path
+   * anchored at a file's own module cannot reach them, so resolution drops
+   * them from that path's candidates. Resolution input only, never persisted.
+   */
+  rustInlineDeclaredSymbols: Map<string, string>;
 }> {
   ensureDynamicLanguages();
 
@@ -956,6 +998,43 @@ export async function buildCodeGraph(
     ? buildGodotUidIndexes(resolvedPath, fileSet, godotRootCache)
     : undefined;
 
+  // Symbol resolution needs the same nearest-project boundary as import
+  // resolution. Keep each project's class names, autoloads, and res:// root
+  // isolated so duplicate names in sibling or nested projects cannot cross.
+  let godotContext: GodotSymbolResolutionContext | undefined;
+  if (hasGodotFiles) {
+    const projectRootByFile = new Map<string, string>();
+    for (const relPath of files) {
+      if (!relPath.endsWith(".gd") && !relPath.endsWith(".tscn") && !relPath.endsWith(".tres")) {
+        continue;
+      }
+      const root = findGodotRootForFile(
+        path.join(resolvedPath, relPath),
+        godotProjectIndexes,
+        godotRootCache,
+      );
+      if (root) projectRootByFile.set(relPath, root);
+    }
+
+    const projectsByRoot = new Map<string, {
+      rootOffset: string;
+      classNameIndex: ReadonlyMap<string, string>;
+      autoloadTable: ReadonlyMap<string, string>;
+    }>();
+    for (const [godotRoot, classNameIndex] of godotProjectIndexes ?? []) {
+      const rootOffset = toForwardSlash(path.relative(resolvedPath, godotRoot));
+      const autoloadTable = new Map<string, string>();
+      for (const [name, resourcePath] of parseGodotAutoloads(godotRoot)) {
+        const repoPath = rootOffset ? `${rootOffset}/${resourcePath}` : resourcePath;
+        autoloadTable.set(name, repoPath);
+      }
+      projectsByRoot.set(godotRoot, { rootOffset, classNameIndex, autoloadTable });
+    }
+    if (projectsByRoot.size > 0) {
+      godotContext = { projectRootByFile, projectsByRoot };
+    }
+  }
+
   if (progress) {
     progress.filesTotal = files.length;
     progress.phase = "analyzing imports";
@@ -969,6 +1048,9 @@ export async function buildCodeGraph(
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
   const inferredTypesByFile = new Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>();
   const memberAssignmentsByFile = new Map<string, Array<{ receiver: string; memberName: string; valueType: string }>>();
+  const rustBindingsByFile = new Map<string, RustUseBinding[]>();
+  const rustInlineScopedCalls = new Set<SymbolEdge>();
+  const rustInlineDeclaredSymbols = new Map<string, string>();
 
   // Per-reason counts, holding only the reasons that actually fired — the build log
   // emits `skipReasons` straight from this map, so it never carries a zero.
@@ -1080,6 +1162,36 @@ export async function buildCodeGraph(
   // resolving from the file's own position, as before.
   const hasRust = files.some((f) => path.extname(f).toLowerCase() === ".rs");
   const rustCrates = hasRust ? buildRustCrateMap(fileSet, resolvedPath) : undefined;
+
+  // Which crate each Rust file belongs to, as a path prefix. `crate::` is
+  // relative to a crate's own root module, so resolution needs the boundary —
+  // and the manifests are what draw it. Deriving it from the path instead
+  // means guessing at a layout: a marker like `src/` misses a crate that has
+  // no `src/` directory (ripgrep) and misreads one whose sources start at the
+  // project root (tokio), and the guess fails silently in both.
+  //
+  // The owning crate is the one whose directory contains the file and is
+  // deepest, with the workspace root at `"."` ranking as no depth at all —
+  // the same rule the import resolver settled on. A crate at the root confines
+  // nothing, which is correct: there is only one crate to be in.
+  const rustCrateRootByFile = new Map<string, string>();
+  const rustCrateRootsByFile = new Map<string, string[]>();
+  if (rustCrates && rustCrates.length > 0) {
+    const depthOf = (crate: { dir: string }): number => (crate.dir === "." ? 0 : crate.dir.length);
+    const ranked = [...rustCrates].sort((a, b) => depthOf(b) - depthOf(a));
+    for (const relPath of files) {
+      if (!relPath.endsWith(".rs")) continue;
+      const owner = ranked.find((c) => c.dir === "." || relPath.startsWith(`${c.dir}/`));
+      if (owner) {
+        rustCrateRootByFile.set(relPath, owner.dir === "." ? "" : `${owner.dir}/`);
+        // Only a parsed manifest is complete enough to make absence a verdict.
+        // An unreadable manifest contributes convention roots for import
+        // recovery, but those roots must not hide a custom target it could not
+        // declare to us.
+        if (!owner.manifestUnread) rustCrateRootsByFile.set(relPath, [...owner.roots]);
+      }
+    }
+  }
 
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
@@ -1206,7 +1318,24 @@ export async function buildCodeGraph(
     try {
       const extracted = extractSymbolsAndCalls(source, extractionLang, ext, relPath);
       symbolsByFile.set(relPath, extracted.symbols);
-      outgoingCallsByFile.set(relPath, rawCallsToUnresolvedEdges(extracted.rawCalls));
+      const edges = rawCallsToUnresolvedEdges(extracted.rawCalls);
+      outgoingCallsByFile.set(relPath, edges);
+      // One edge per raw call, in order, so the call at `i` is the edge at `i`.
+      // The flag stays out of the edge itself: it is resolution's business and
+      // the store must not grow a field for it.
+      for (let i = 0; i < extracted.rawCalls.length; i++) {
+        if (extracted.rawCalls[i].qualifierRootedInInlineMod) rustInlineScopedCalls.add(edges[i]);
+      }
+      // Same reason, one level down: which declarations sit inside an inline
+      // `mod` is visible in the extractor and nowhere after it.
+      if (extracted.inlineModSymbolIds) {
+        for (const [id, owner] of extracted.inlineModSymbolIds) {
+          rustInlineDeclaredSymbols.set(id, owner);
+        }
+      }
+      if (extracted.bindings && extracted.bindings.length > 0) {
+        rustBindingsByFile.set(relPath, extracted.bindings);
+      }
       if (extracted.inferredTypes && extracted.inferredTypes.size > 0) {
         inferredTypesByFile.set(relPath, extracted.inferredTypes);
       }
@@ -1329,42 +1458,36 @@ export async function buildCodeGraph(
     ...(skipsByReason.size > 0 ? { skipReasons: Object.fromEntries(skipsByReason) } : {}),
   });
 
-  // Build autoload table from ALL Godot project roots (per-project fix).
-  // Previously this used a single root (findGodotProjectRootForProject),
-  // which missed autoloads in monorepos with multiple Godot projects.
-  // Now we merge autoloads from every project root discovered above.
-  // Autoload res:// paths are normalized to repo-relative paths so they
-  // match symbolIndexByFile keys (which are repo-relative).
+  // Preserve the single-project fields introduced with GDScript symbol
+  // resolution for direct callers. Multi-project builds deliberately leave
+  // them empty: no unscoped map can represent duplicate autoload names or
+  // duplicate res:// paths safely, and `godotContext` carries the complete
+  // caller-scoped representation used by the production resolver.
   let autoloadTable: Map<string, string> | undefined;
-  // Map res://-relative paths → repo-relative paths, for normalizing
-  // script:res:// markers in .tscn files when the Godot project is in a
-  // subdirectory of the repo (nested Godot projects).
   const resToRepoPathMap = new Map<string, string>();
-  if (godotProjectIndexes && godotProjectIndexes.size > 0) {
-    autoloadTable = new Map<string, string>();
-    for (const godotRoot of godotProjectIndexes.keys()) {
-      const rootOffset = toForwardSlash(path.relative(resolvedPath, godotRoot));
-      const autoloads = parseGodotAutoloads(godotRoot);
-      for (const [name, resPath] of autoloads) {
-        // Normalize res:// path to repo-relative by prepending the Godot
-        // root's offset within the repo (empty for root-level projects).
-        const repoRel = rootOffset ? `${rootOffset}/${resPath}` : resPath;
-        autoloadTable.set(name, repoRel);
-        // Also map the res://-relative path for script:res:// normalization
-        resToRepoPathMap.set(resPath, repoRel);
-      }
+  if (godotContext?.projectsByRoot.size === 1) {
+    const [godotRoot, project] = godotContext.projectsByRoot.entries().next().value as [
+      string,
+      { rootOffset: string; autoloadTable: ReadonlyMap<string, string> },
+    ];
+    autoloadTable = new Map(project.autoloadTable);
+    const prefix = project.rootOffset ? `${project.rootOffset}/` : "";
+    for (const [repoPath, ownerRoot] of godotContext.projectRootByFile) {
+      if (ownerRoot !== godotRoot) continue;
+      const resourcePath = prefix && repoPath.startsWith(prefix)
+        ? repoPath.slice(prefix.length)
+        : repoPath;
+      resToRepoPathMap.set(resourcePath, repoPath);
     }
-  } else {
-    // Fallback: single-root lookup for projects without per-project indexes
+  } else if (!godotContext) {
     const godotRoot = findGodotProjectRootForProject(resolvedPath);
     if (godotRoot) {
       const rootOffset = toForwardSlash(path.relative(resolvedPath, godotRoot));
-      const autoloads = parseGodotAutoloads(godotRoot);
-      autoloadTable = new Map<string, string>();
-      for (const [name, resPath] of autoloads) {
-        const repoRel = rootOffset ? `${rootOffset}/${resPath}` : resPath;
-        autoloadTable.set(name, repoRel);
-        resToRepoPathMap.set(resPath, repoRel);
+      autoloadTable = new Map();
+      for (const [name, resourcePath] of parseGodotAutoloads(godotRoot)) {
+        const repoPath = rootOffset ? `${rootOffset}/${resourcePath}` : resourcePath;
+        autoloadTable.set(name, repoPath);
+        resToRepoPathMap.set(resourcePath, repoPath);
       }
     }
   }
@@ -1376,7 +1499,13 @@ export async function buildCodeGraph(
     outgoingCallsByFile,
     autoloadTable,
     resToRepoPathMap,
+    godotContext,
     inferredTypesByFile,
     memberAssignmentsByFile,
+    rustBindingsByFile,
+    rustCrateRootByFile,
+    rustCrateRootsByFile,
+    rustInlineScopedCalls,
+    rustInlineDeclaredSymbols,
   };
 }
