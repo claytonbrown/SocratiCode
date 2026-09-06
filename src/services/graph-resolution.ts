@@ -3305,6 +3305,76 @@ function findGodotProjectRoot(sourceFile: string): string | null {
 }
 
 /**
+ * Normalize a `res://`-relative path by collapsing `./` and `../` segments.
+ * E.g. `scripts/../core/GameManager.gd` → `core/GameManager.gd`.
+ * Unlike path.normalize, this preserves forward slashes and does not
+ * resolve to an absolute path.
+ */
+function normalizeResPath(resPath: string): string {
+  const parts = resPath.split("/");
+  const result: string[] = [];
+  for (const part of parts) {
+    if (part === "." || part === "") continue;
+    if (part === "..") {
+      result.pop();
+      continue;
+    }
+    result.push(part);
+  }
+  return result.join("/");
+}
+
+/**
+ * Parse the `[autoload]` section from a Godot `project.godot` file and build
+ * a map of autoload name → relative script path.
+ *
+ * The `[autoload]` section has the form:
+ *   [autoload]
+ *   GameManager="*res://scripts/core/GameManager.gd"
+ *   InputManager="res://scripts/core/InputManager.gd"
+ *
+ * The leading `*` means the autoload is enabled (singleton). Both `*` and
+ * non-`*` entries are included — the autoload name is still a global type
+ * regardless of singleton status.
+ *
+ * @param godotProjectRoot - Absolute path to the directory containing project.godot
+ * @returns Map of autoload name → relative path (forward-slash, relative to project root)
+ */
+export function parseGodotAutoloads(godotProjectRoot: string): Map<string, string> {
+  const autoloads = new Map<string, string>();
+  const projectFile = path.join(godotProjectRoot, "project.godot");
+  let content: string;
+  try {
+    content = readFileSync(projectFile, "utf-8");
+  } catch {
+    return autoloads;
+  }
+
+  // Find the [autoload] section and parse key="value" lines until the next
+  // section header or end of file.
+  const lines = content.split("\n");
+  let inAutoloadSection = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("[")) {
+      inAutoloadSection = trimmed === "[autoload]";
+      continue;
+    }
+    if (!inAutoloadSection) continue;
+    // Match: Name="*res://path/to/file.gd" or Name="res://path/to/file.gd"
+    const match = trimmed.match(/^([A-Za-z_][\w]*)\s*=\s*"?\*?res:\/\/([^"]+)"?$/);
+    if (!match) continue;
+    const [, name, resPath] = match;
+    // Normalize: collapse ./ and ../ segments so paths like
+    // `res://scripts/../core/GameManager.gd` resolve correctly.
+    const normalized = normalizeResPath(resPath);
+    autoloads.set(name, toForwardSlash(normalized));
+  }
+
+  return autoloads;
+}
+
+/**
  * Resolve a GDScript class_name reference to a .gd file.
  *
  * Godot class identity comes from the `class_name` declaration, not the

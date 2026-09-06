@@ -566,7 +566,10 @@ export async function getSymbolContext(
       const callees: SymbolContextCallee[] = payload.outgoingCalls
         .filter((e) => e.callerId === sym.id)
         .map((e) => ({
-          name: e.calleeName,
+          // Graphs produced before signalEmit was a separate marker encoded
+          // the marker into calleeName. Normalize those persisted edges on
+          // read so upgrading does not require a graph rebuild.
+          name: e.calleeName.startsWith("signal:") ? e.calleeName.slice(7) : e.calleeName,
           resolved: e.calleeCandidates,
           confidence: e.confidence,
           kind: e.kind,

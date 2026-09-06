@@ -17,6 +17,7 @@ import {
   resolveImport,
 } from "../../src/services/graph-resolution.js";
 import { chunkFileContent } from "../../src/services/indexer.js";
+import { setGdscriptParserAvailable } from "../../src/services/parser-availability.js";
 
 // Register before test declarations so skipIf observes the final availability state.
 ensureDynamicLanguages();
@@ -1231,6 +1232,70 @@ func setup():
       expect(specs).toContain("res://scripts/Base.gd");
       expect(specs).toContain("res://scripts/Helper.gd");
     });
+
+  });
+
+  // ── Regex fallback tests (when native parser is unavailable) ───────────
+
+  describe("GDScript regex fallback", () => {
+    it("extractGdscriptImportsRegex extracts preload and extends", () => {
+      const source = [
+        'extends "res://scripts/Real.gd"',
+        '',
+        'func _ready():',
+        '    preload("res://scripts/Weapon.gd")',
+      ].join('\n');
+
+      const imports = extractGdscriptImportsRegex(source);
+      const specs = imports.map((i) => i.moduleSpecifier);
+
+      expect(specs).toContain("res://scripts/Real.gd");
+      expect(specs).toContain("res://scripts/Weapon.gd");
+    });
+
+    it("extractGdscriptImportsRegex extracts extends with class name", () => {
+      const source = 'extends Node';
+      const imports = extractGdscriptImportsRegex(source);
+      const specs = imports.map((i) => i.moduleSpecifier);
+      expect(specs).toContain("class:Node");
+    });
+
+    it("extractGdscriptImportsRegex skips comment-only preload lines", () => {
+      const source = [
+        '# preload("res://comment.gd")',
+        '# extends "res://ignored.gd"',
+        'extends "res://scripts/Real.gd"',
+      ].join('\n');
+
+      const imports = extractGdscriptImportsRegex(source);
+      const specs = imports.map((i) => i.moduleSpecifier);
+
+      // Comment lines should be skipped
+      expect(specs).not.toContain("res://comment.gd");
+      expect(specs).not.toContain("res://ignored.gd");
+      // Real extends should be extracted
+      expect(specs).toContain("res://scripts/Real.gd");
+    });
+
+    it("extractImports uses regex fallback when native parser is unavailable", () => {
+      const source = [
+        '# preload("res://comment.gd")',
+        'extends "res://scripts/Base.gd"',
+        'preload("res://scripts/Helper.gd")',
+      ].join("\n");
+      const originalAvailability = gdscriptParserAvailable;
+
+      setGdscriptParserAvailable(false);
+      try {
+        const imports = extractImports(source, "gdscript", ".gd");
+        expect(imports.map((item) => item.moduleSpecifier)).toEqual([
+          "res://scripts/Base.gd",
+          "res://scripts/Helper.gd",
+        ]);
+      } finally {
+        setGdscriptParserAvailable(originalAvailability);
+      }
+    });
   });
 
   // ── Native loader preflight tests ──────────────────────────────────────
@@ -2225,9 +2290,9 @@ func setup():
         undefined, // pythonImportRoots
         undefined, // elixirModuleMap
         undefined, // phpFqcnMap
-        undefined,
-        undefined,
-        undefined,
+        undefined, // rustCrates
+        undefined, // rustDeclaredMods
+        undefined, // rustIsDeclaration
         undefined, // classNameIndex
         root,      // godotProjectRoot
         uidIndex,  // godotUidIndex
@@ -2259,9 +2324,9 @@ func setup():
         undefined, // pythonImportRoots
         undefined, // elixirModuleMap
         undefined, // phpFqcnMap
-        undefined,
-        undefined,
-        undefined,
+        undefined, // rustCrates
+        undefined, // rustDeclaredMods
+        undefined, // rustIsDeclaration
         undefined, // classNameIndex
         root,      // godotProjectRoot
         uidIndex,  // godotUidIndex

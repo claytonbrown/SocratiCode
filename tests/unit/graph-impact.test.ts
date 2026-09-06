@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
 import { describe, expect, it } from "vitest";
-import { getImpactRadius } from "../../src/services/graph-impact.js";
+import { getImpactRadius, getSymbolContext } from "../../src/services/graph-impact.js";
 import { SymbolGraphCache } from "../../src/services/symbol-graph-cache.js";
 import type { SymbolGraphFilePayload, SymbolGraphMeta, SymbolNode } from "../../src/types.js";
 
@@ -61,6 +61,58 @@ function createMockCache(opts: {
 }
 
 describe("graph-impact exact symbol traversal and fail-closed", () => {
+  it("normalizes legacy encoded signal names without requiring a graph rebuild", async () => {
+    const caller: SymbolNode = {
+      id: "scripts/Fighter.gd::Fighter.take_damage#6",
+      name: "take_damage",
+      qualifiedName: "Fighter.take_damage",
+      kind: "method",
+      file: "scripts/Fighter.gd",
+      line: 6,
+      endLine: 7,
+      language: "gdscript",
+    };
+    const signal: SymbolNode = {
+      id: "scripts/Fighter.gd::Fighter.died#4",
+      name: "died",
+      qualifiedName: "Fighter.died",
+      kind: "signal",
+      file: "scripts/Fighter.gd",
+      line: 4,
+      endLine: 4,
+      language: "gdscript",
+    };
+    const payload: SymbolGraphFilePayload = {
+      file: "scripts/Fighter.gd",
+      language: "gdscript",
+      contentHash: "legacy",
+      symbols: [caller, signal],
+      outgoingCalls: [{
+        callerId: caller.id,
+        calleeName: "signal:died",
+        calleeCandidates: [signal.id],
+        confidence: "unique",
+        kind: "call",
+        callSite: { file: "scripts/Fighter.gd", line: 7 },
+      }],
+    };
+    const cache = createMockCache({
+      symbols: payload.symbols,
+      reverseFileIndex: new Map(),
+      filePayloads: new Map([[payload.file, payload]]),
+    });
+
+    const contexts = await getSymbolContext(cache, "take_damage");
+
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0].callees).toEqual([{
+      name: "died",
+      resolved: [signal.id],
+      confidence: "unique",
+      kind: "call",
+    }]);
+  });
+
   it("returns not_found status when symbol is not in index", async () => {
     const cache = createMockCache({
       symbols: [],

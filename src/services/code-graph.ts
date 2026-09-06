@@ -18,8 +18,12 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotRootForFile, type GodotUidIndex, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
-import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotProjectRootForProject, findGodotRootForFile, type GodotUidIndex, parseGodotAutoloads, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import {
+  computeUnresolvedPct,
+  type GodotSymbolResolutionContext,
+  resolveCallSites,
+} from "./graph-symbol-resolution.js";
 import {
   extractSymbolsAndCalls,
   type RustUseBinding,
@@ -28,6 +32,7 @@ import {
 
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { logger } from "./logger.js";
+import { setGdscriptParserAvailable } from "./parser-availability.js";
 import { deleteGraphData, describeQdrantError, getGraphMetadata, loadGraphData, saveGraphData } from "./qdrant.js";
 import {
   dropSymbolGraphCache,
@@ -253,6 +258,8 @@ async function doRebuildGraph(
     if (!opts.skipSymbolGraph) {
       try {
         progress.phase = "resolving symbols";
+        // Use the autoload table built by buildCodeGraph (per-project, merged
+        // from all Godot project roots) for GDScript receiver-type resolution.
         resolveCallSites(
           graph,
           built.symbolsByFile,
@@ -262,6 +269,11 @@ async function doRebuildGraph(
           built.rustInlineScopedCalls,
           built.rustInlineDeclaredSymbols,
           built.rustCrateRootsByFile,
+          built.autoloadTable,
+          built.inferredTypesByFile,
+          built.memberAssignmentsByFile,
+          built.resToRepoPathMap,
+          built.godotContext,
         );
 
         progress.phase = "persisting symbols";
@@ -601,7 +613,7 @@ export function getDynamicLanguageStatus(): DynamicLanguageStatus {
  * without a compatible artifact (e.g. linux-arm64) this stays false so
  * callers can skip AST processing and use syntax-aware fallback extraction.
  */
-export let gdscriptParserAvailable = false;
+export { gdscriptParserAvailable } from "./parser-availability.js";
 
 /**
  * Preflight the tree-sitter-gdscript native addon in an isolated child
@@ -732,7 +744,7 @@ export function ensureDynamicLanguages(): void {
         failedDynamicLanguages.delete(name);
       }
       if (survivors.gdscript) {
-        gdscriptParserAvailable = true;
+        setGdscriptParserAvailable(true);
       }
       logger.info("Registered dynamic ast-grep languages", {
         languages: [...loadedDynamicLanguages].sort(),
@@ -889,6 +901,9 @@ export async function getGraphableFiles(
         // Godot resource files (.tscn/.tres) have no AST grammar but use tokenizer-based
         // import extraction for [ext_resource] declarations.
         const isGodotResource = ext === ".tscn" || ext === ".tres";
+        // .uid sidecar files contain UID strings for Godot's uid:// path
+        // resolution. They are not graph nodes themselves, but they must
+        // be in the file set so buildGodotUidIndexes can read them.
         const isGodotUid = ext === ".uid";
         if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext) || isGodotResource || isGodotUid) {
           files.push(relPath);
@@ -929,6 +944,11 @@ export async function buildCodeGraph(
 ): Promise<CodeGraph & {
   symbolsByFile: Map<string, SymbolNode[]>;
   outgoingCallsByFile: Map<string, SymbolEdge[]>;
+  autoloadTable?: Map<string, string>;
+  resToRepoPathMap: Map<string, string>;
+  godotContext?: GodotSymbolResolutionContext;
+  inferredTypesByFile: Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>;
+  memberAssignmentsByFile: Map<string, Array<{ receiver: string; memberName: string; valueType: string }>>;
   /** Rust `use` bindings per file — resolution input only, never persisted. */
   rustBindingsByFile: Map<string, RustUseBinding[]>;
   /** Rust file → its crate's directory prefix. Resolution input only. */
@@ -978,6 +998,43 @@ export async function buildCodeGraph(
     ? buildGodotUidIndexes(resolvedPath, fileSet, godotRootCache)
     : undefined;
 
+  // Symbol resolution needs the same nearest-project boundary as import
+  // resolution. Keep each project's class names, autoloads, and res:// root
+  // isolated so duplicate names in sibling or nested projects cannot cross.
+  let godotContext: GodotSymbolResolutionContext | undefined;
+  if (hasGodotFiles) {
+    const projectRootByFile = new Map<string, string>();
+    for (const relPath of files) {
+      if (!relPath.endsWith(".gd") && !relPath.endsWith(".tscn") && !relPath.endsWith(".tres")) {
+        continue;
+      }
+      const root = findGodotRootForFile(
+        path.join(resolvedPath, relPath),
+        godotProjectIndexes,
+        godotRootCache,
+      );
+      if (root) projectRootByFile.set(relPath, root);
+    }
+
+    const projectsByRoot = new Map<string, {
+      rootOffset: string;
+      classNameIndex: ReadonlyMap<string, string>;
+      autoloadTable: ReadonlyMap<string, string>;
+    }>();
+    for (const [godotRoot, classNameIndex] of godotProjectIndexes ?? []) {
+      const rootOffset = toForwardSlash(path.relative(resolvedPath, godotRoot));
+      const autoloadTable = new Map<string, string>();
+      for (const [name, resourcePath] of parseGodotAutoloads(godotRoot)) {
+        const repoPath = rootOffset ? `${rootOffset}/${resourcePath}` : resourcePath;
+        autoloadTable.set(name, repoPath);
+      }
+      projectsByRoot.set(godotRoot, { rootOffset, classNameIndex, autoloadTable });
+    }
+    if (projectsByRoot.size > 0) {
+      godotContext = { projectRootByFile, projectsByRoot };
+    }
+  }
+
   if (progress) {
     progress.filesTotal = files.length;
     progress.phase = "analyzing imports";
@@ -989,6 +1046,8 @@ export async function buildCodeGraph(
   const edges: CodeGraphEdge[] = [];
   const symbolsByFile = new Map<string, SymbolNode[]>();
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
+  const inferredTypesByFile = new Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>();
+  const memberAssignmentsByFile = new Map<string, Array<{ receiver: string; memberName: string; valueType: string }>>();
   const rustBindingsByFile = new Map<string, RustUseBinding[]>();
   const rustInlineScopedCalls = new Set<SymbolEdge>();
   const rustInlineDeclaredSymbols = new Map<string, string>();
@@ -1156,6 +1215,13 @@ export async function buildCodeGraph(
       lang = detectedLang;
     }
 
+    // .uid sidecar files are in the file set for UID index building but
+    // are not graph nodes — they contain no code, just a UID string.
+    if (ext === ".uid") {
+      if (progress) progress.filesProcessed++;
+      continue;
+    }
+
     // Extra extensions with no parser are included as leaf nodes so they can be
     // targets of import edges, but we skip import extraction since we can't
     // parse them. Godot resource files (.tscn/.tres) are an exception: they
@@ -1270,6 +1336,12 @@ export async function buildCodeGraph(
       if (extracted.bindings && extracted.bindings.length > 0) {
         rustBindingsByFile.set(relPath, extracted.bindings);
       }
+      if (extracted.inferredTypes && extracted.inferredTypes.size > 0) {
+        inferredTypesByFile.set(relPath, extracted.inferredTypes);
+      }
+      if (extracted.memberAssignments && extracted.memberAssignments.length > 0) {
+        memberAssignmentsByFile.set(relPath, extracted.memberAssignments);
+      }
     } catch (err) {
       logger.debug("Symbol extraction failed (continuing)", {
         file: relPath,
@@ -1329,6 +1401,8 @@ export async function buildCodeGraph(
       // fileClassNameIndex stays undefined when no project root is found,
       // preventing cross-project class_name leakage.
     }
+    // Non-Godot files or projects without Godot indexes: fileClassNameIndex
+    // and fileGodotRoot stay undefined — resolveImport ignores them.
 
     for (const imp of importInfos) {
       node.imports.push(imp.moduleSpecifier);
@@ -1384,11 +1458,50 @@ export async function buildCodeGraph(
     ...(skipsByReason.size > 0 ? { skipReasons: Object.fromEntries(skipsByReason) } : {}),
   });
 
+  // Preserve the single-project fields introduced with GDScript symbol
+  // resolution for direct callers. Multi-project builds deliberately leave
+  // them empty: no unscoped map can represent duplicate autoload names or
+  // duplicate res:// paths safely, and `godotContext` carries the complete
+  // caller-scoped representation used by the production resolver.
+  let autoloadTable: Map<string, string> | undefined;
+  const resToRepoPathMap = new Map<string, string>();
+  if (godotContext?.projectsByRoot.size === 1) {
+    const [godotRoot, project] = godotContext.projectsByRoot.entries().next().value as [
+      string,
+      { rootOffset: string; autoloadTable: ReadonlyMap<string, string> },
+    ];
+    autoloadTable = new Map(project.autoloadTable);
+    const prefix = project.rootOffset ? `${project.rootOffset}/` : "";
+    for (const [repoPath, ownerRoot] of godotContext.projectRootByFile) {
+      if (ownerRoot !== godotRoot) continue;
+      const resourcePath = prefix && repoPath.startsWith(prefix)
+        ? repoPath.slice(prefix.length)
+        : repoPath;
+      resToRepoPathMap.set(resourcePath, repoPath);
+    }
+  } else if (!godotContext) {
+    const godotRoot = findGodotProjectRootForProject(resolvedPath);
+    if (godotRoot) {
+      const rootOffset = toForwardSlash(path.relative(resolvedPath, godotRoot));
+      autoloadTable = new Map();
+      for (const [name, resourcePath] of parseGodotAutoloads(godotRoot)) {
+        const repoPath = rootOffset ? `${rootOffset}/${resourcePath}` : resourcePath;
+        autoloadTable.set(name, repoPath);
+        resToRepoPathMap.set(resourcePath, repoPath);
+      }
+    }
+  }
+
   return {
     nodes: Array.from(nodesMap.values()),
     edges,
     symbolsByFile,
     outgoingCallsByFile,
+    autoloadTable,
+    resToRepoPathMap,
+    godotContext,
+    inferredTypesByFile,
+    memberAssignmentsByFile,
     rustBindingsByFile,
     rustCrateRootByFile,
     rustCrateRootsByFile,

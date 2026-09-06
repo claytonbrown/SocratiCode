@@ -640,6 +640,19 @@ describe("graph-symbol-resolution", () => {
     expect(computeUnresolvedPct(map)).toBe(50);
   });
 
+  it("computeUnresolvedPct excludes engine-owned calls from the denominator", () => {
+    const map = new Map<string, SymbolEdge[]>([
+      [
+        "scripts/player.gd",
+        [
+          { callerId: "x", calleeName: "print", kind: "call", calleeCandidates: [], confidence: "engine", callSite: { file: "scripts/player.gd", line: 1 } },
+          { callerId: "x", calleeName: "missing", kind: "call", calleeCandidates: [], confidence: "unresolved", callSite: { file: "scripts/player.gd", line: 2 } },
+        ],
+      ],
+    ]);
+    expect(computeUnresolvedPct(map)).toBe(100);
+  });
+
   it("does not resolve an internal helper through an aliased namespace re-export barrel", () => {
     const graph: CodeGraph = {
       nodes: [

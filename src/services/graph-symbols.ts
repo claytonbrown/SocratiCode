@@ -12,6 +12,7 @@ import { getLanguageFromExtension } from "../constants.js";
 import type { EdgeKind, SymbolEdge, SymbolKind, SymbolNode } from "../types.js";
 import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templates.js";
 import { logger } from "./logger.js";
+import { gdscriptParserAvailable } from "./parser-availability.js";
 
 /** Result of extracting symbols + raw call sites from a file. */
 /**
@@ -58,7 +59,25 @@ export interface ExtractedSymbols {
      */
     qualifierRootedInInlineMod?: boolean;
     callSite: { file: string; line: number };
+    /** Receiver expression for method calls (e.g. "fighter" in "fighter.take_damage()").
+     *  Present only for attribute_call nodes; bare calls have no receiver. */
+    receiver?: string;
+    /** True when this call represents a GDScript `signal_name.emit()`. */
+    signalEmit?: boolean;
   }>;
+  /** Inferred variable types from assignment sites (var x = Expr, x = Expr).
+   *  Maps variable name → list of inferences, each with the enclosing scope's
+   *  line range. This prevents cross-function name collisions (e.g. two
+   *  functions each declaring `var f = X.new()` no longer overwrite each other).
+   *  Special markers in the type field:
+   *  - "<self>" → type is the file's class_name (resolved during resolution)
+   *  - "ref:varName" → type is the same as varName's type (resolved during resolution)
+   *  Present only for GDScript files with assignment-site inferences. */
+  inferredTypes?: Map<string, Array<{ type: string; startLine: number; endLine: number }>>;
+  /** Member assignments: `receiver.memberName = value` → records for cross-file
+   *  member type propagation. valueType uses the same markers as inferredTypes.
+   *  Present only for GDScript files with member assignments. */
+  memberAssignments?: Array<{ receiver: string; memberName: string; valueType: string }>;
   /** Rust `use` bindings declared by this file. Absent for every other language. */
   bindings?: RustUseBinding[];
   /**
@@ -291,6 +310,12 @@ export function extractSymbolsAndCalls(
     }
     if (langKey === "elixir") {
       return extractFromElixir(source, relativePath, language, moduleSymbol);
+    }
+    if (langKey === "gdscript") {
+      return extractFromGdscript(source, relativePath, language, moduleSymbol);
+    }
+    if (langKey === "godot-resource") {
+      return extractFromGodotResource(source, relativePath, language, moduleSymbol);
     }
     // Svelte, Vue and others fall through to the regex fallback.
     return extractFromRegex(source, relativePath, language, moduleSymbol);
@@ -2718,6 +2743,908 @@ function extractFromBash(
   return { symbols, rawCalls };
 }
 
+// ── Godot Resource (.tscn / .tres) — text-based extraction ────────────────
+
+/**
+ * Extract symbols from Godot scene (.tscn) and resource (.tres) files.
+ *
+ * These are text-based Godot resource formats with INI-like sections:
+ *   [gd_scene load_steps=2 format=3]
+ *   [ext_resource type="Script" path="res://scripts/Fighter.gd" id="1"]
+ *   [node name="Fighter" type="CharacterBody2D"]
+ *   script = ExtResource("1")
+ *   [node name="HealthBar" type="ProgressBar" parent="."]
+ *
+ * We extract:
+ * - Node definitions as variable symbols (name = node name, typeName = node type)
+ *   so $NodePath resolution can look them up by name.
+ * - Sub-resource definitions as variable symbols (typeName = resource type).
+ *
+ * External resource references ([ext_resource]) are handled by graph-imports.ts
+ * for the file-import graph, not here.
+ */
+function extractFromGodotResource(
+  source: string,
+  file: string,
+  language: string,
+  moduleSym: SymbolNode,
+): ExtractedSymbols {
+  const symbols: SymbolNode[] = [moduleSym];
+  const rawCalls: ExtractedSymbols["rawCalls"] = [];
+  const lines = source.split("\n");
+
+  // Match section headers — attributes can appear in any order in Godot's
+  // text resource format, so we match the header and extract attributes
+  // generically (same approach for node, sub_resource, and ext_resource).
+  const nodeHeaderRegex = /^\[node\s+/;
+  const subResourceHeaderRegex = /^\[sub_resource\s+/;
+  const extResourceHeaderRegex = /^\[ext_resource\s+/;
+  const sectionHeaderRegex = /^\[/;
+  const attrPairRegex = /(\w+)="([^"]*)"/g;
+  // Match script = ExtResource("id") within node sections
+  const scriptAssignRegex = /^script\s*=\s*ExtResource\(["']([^"']+)["']\)/;
+
+  /** Extract quoted key/value attributes from one Godot resource header. */
+  const headerAttributes = (line: string): Map<string, string> => {
+    const attrs = new Map<string, string>();
+    attrPairRegex.lastIndex = 0;
+    for (;;) {
+      const match = attrPairRegex.exec(line);
+      if (!match) return attrs;
+      attrs.set(match[1], match[2]);
+    }
+  };
+
+  // Map ext_resource id → resource path (for script lookups)
+  const extResourcePaths = new Map<string, string>();
+  // Track the current node section for script assignment parsing
+  let currentNodeName: string | null = null;
+  let currentNodeType: string | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // A script assignment belongs only to the immediately enclosing node
+    // section. Any other section ends that node, including connection and
+    // editable sections that do not otherwise produce symbols here.
+    if (sectionHeaderRegex.test(line) && !nodeHeaderRegex.test(line)) {
+      currentNodeName = null;
+      currentNodeType = null;
+    }
+
+    // Ext resource declaration — extract path, type, and id from any order
+    if (extResourceHeaderRegex.test(line)) {
+      const attrs = headerAttributes(line);
+      const resPath = attrs.get("path") ?? "";
+      const resType = attrs.get("type") ?? "";
+      const resId = attrs.get("id") ?? "";
+      if (!resPath || !resId) continue;
+      // Only track Script resources (the ones that matter for type resolution)
+      if (resType === "Script" || resPath.endsWith(".gd")) {
+        extResourcePaths.set(resId, resPath);
+      }
+      continue;
+    }
+
+    // Node definition — extract name and type from any attribute order
+    if (nodeHeaderRegex.test(line)) {
+      const attrs = headerAttributes(line);
+      currentNodeName = attrs.get("name") ?? null;
+      currentNodeType = attrs.get("type") ?? "Node";
+      if (!currentNodeName) continue;
+
+      const name = currentNodeName;
+      const nodeType = currentNodeType;
+      const qn = name; // Node names are top-level in the scene
+      const sym: SymbolNode = {
+        id: makeId(file, qn, i + 1),
+        name,
+        qualifiedName: qn,
+        kind: "variable",
+        file,
+        line: i + 1,
+        endLine: i + 1,
+        language,
+        typeName: nodeType,
+      };
+      symbols.push(sym);
+      continue;
+    }
+
+    // Sub-resource definition — extract type and id from any attribute order
+    if (subResourceHeaderRegex.test(line)) {
+      const attrs = headerAttributes(line);
+      const resType = attrs.get("type") ?? "";
+      const resId = attrs.get("id") ?? "";
+      if (!resId) continue;
+      const qn = `<sub_resource:${resId}>`;
+      const sym: SymbolNode = {
+        id: makeId(file, qn, i + 1),
+        name: resId,
+        qualifiedName: qn,
+        kind: "variable",
+        file,
+        line: i + 1,
+        endLine: i + 1,
+        language,
+        typeName: resType,
+      };
+      symbols.push(sym);
+      currentNodeName = null; // We're in a sub_resource section, not a node
+      continue;
+    }
+
+    // Script assignment within a node section
+    if (currentNodeName) {
+      const scriptMatch = line.match(scriptAssignRegex);
+      if (scriptMatch) {
+        const extId = scriptMatch[1];
+        const scriptPath = extResourcePaths.get(extId);
+        if (scriptPath) {
+          // Update the last-pushed node symbol's typeName to a script marker.
+          // The marker `script:res://path` is resolved during call-site
+          // resolution to the actual class_name.
+          const nodeSym = symbols[symbols.length - 1];
+          if (nodeSym && nodeSym.kind === "variable" && nodeSym.name === currentNodeName) {
+            nodeSym.typeName = `script:${scriptPath}`;
+          }
+        }
+      }
+    }
+  }
+
+  return { symbols, rawCalls };
+}
+
+/**
+ * Extract symbols from GDScript source using the tree-sitter GDScript grammar.
+ *
+ * Extracts:
+ * - `class_name` declarations as class symbols
+ * - `function_definition` nodes as method symbols (qualified with class_name)
+ * - `variable_statement` with `type` child as typed variable records (for
+ *   receiver-type resolution in Phase 4)
+ * - `call` nodes as bare function calls (callee name only)
+ * - `attribute` → `attribute_call` as method calls with receiver + method name
+ *
+ * Falls back to regex extraction when the tree-sitter parser is unavailable
+ * (e.g. linux-arm64 has no prebuild).
+ */
+function extractFromGdscript(
+  source: string,
+  file: string,
+  language: string,
+  moduleSym: SymbolNode,
+): ExtractedSymbols {
+  // Check if the GDScript parser is available; if not, use regex fallback.
+  // The import is a live ESM binding from code-graph.ts, set during
+  // ensureDynamicLanguages() at startup.
+  if (!gdscriptParserAvailable) {
+    return extractFromRegex(source, file, language, moduleSym);
+  }
+
+  const root = parse("gdscript" as unknown as Lang, source).root();
+  const symbols: SymbolNode[] = [moduleSym];
+  const scopes: ScopeFrame[] = [];
+  const rawCalls: ExtractedSymbols["rawCalls"] = [];
+  // Cache line count to avoid repeated source.split("\n") calls.
+  const totalLines = source.split("\n").length;
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const kidsOf = (n: any): any[] => {
+    try {
+      return n.children();
+    } catch {
+      return [];
+    }
+  };
+
+  // Detect parse errors (ERROR/MISSING nodes from tree-sitter) and log a
+  // diagnostic so users can identify malformed GDScript that produces
+  // incomplete symbol extraction. We only scan the top-level children to
+  // keep this cheap — deeply nested errors are still caught by the
+  // extraction logic falling back to regex for unrecognized constructs.
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const topKids: any[] = kidsOf(root);
+  const errorCount = topKids.filter((n) => {
+    try {
+      return n.kind() === "ERROR" || n.kind() === "MISSING";
+    } catch {
+      return false;
+    }
+  }).length;
+  if (errorCount > 0) {
+    logger.debug("GDScript parse errors detected — symbol extraction may be incomplete", {
+      file,
+      errorNodes: errorCount,
+      totalLines,
+    });
+  }
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const lineOf = (n: any): number => n.range().start.line + 1;
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const endLineOf = (n: any): number => n.range().end.line + 1;
+
+  // ── Extract class_name ──────────────────────────────────────────────
+  let className: string | null = null;
+  for (const node of safeFindAll(root, "class_name_statement")) {
+    const nameNode = safeFind(node, "name");
+    if (nameNode) {
+      const cn = nameNode.text();
+      className = cn;
+      const startLine = lineOf(node);
+      const endLine = totalLines;
+      const sym: SymbolNode = {
+        id: makeId(file, cn, startLine),
+        name: cn,
+        qualifiedName: cn,
+        kind: "class",
+        file,
+        line: startLine,
+        endLine,
+        language,
+        isGdscriptClassName: true,
+      };
+      symbols.push(sym);
+      scopes.push({ name: cn, startLine, endLine, symbolId: sym.id });
+      break; // Only one class_name per file
+    }
+  }
+
+  // ── Extract inner classes ───────────────────────────────────────────
+  // `class Inner extends Node:` — inner classes are separate from class_name.
+  // Their methods must be qualified with the inner class name, not the outer
+  // class_name. We build a map of inner class range → qualified name so the
+  // function extractor can check if a function is inside an inner class by
+  // comparing line ranges (ast-grep node identity is not stable across
+  // separate findAll calls, so we can't use a Map keyed by node reference).
+  const innerClasses: Array<{ qn: string; startLine: number; endLine: number }> = [];
+  for (const cls of safeFindAll(root, "class_definition")) {
+    const nameNode = safeFind(cls, "name");
+    if (!nameNode) continue;
+    const innerName = nameNode.text();
+    const startLine = lineOf(cls);
+    const endLine = endLineOf(cls);
+    // Build the full qualified name by checking if this inner class is nested
+    // inside another inner class. We pick the narrowest enclosing inner class
+    // (processed so far) and prepend its QN, so `class More` inside `class Inner`
+    // inside `class_name Outer` gets `Outer.Inner.More`, not `Outer.More`.
+    let prefix = className;
+    let bestSpan = Infinity;
+    for (const ic of innerClasses) {
+      if (startLine >= ic.startLine && startLine <= ic.endLine) {
+        const span = ic.endLine - ic.startLine;
+        if (span < bestSpan) {
+          prefix = ic.qn;
+          bestSpan = span;
+        }
+      }
+    }
+    const innerQn = prefix ? `${prefix}.${innerName}` : innerName;
+    const sym: SymbolNode = {
+      id: makeId(file, innerQn, startLine),
+      name: innerName,
+      qualifiedName: innerQn,
+      kind: "class",
+      file,
+      line: startLine,
+      endLine,
+      language,
+    };
+    symbols.push(sym);
+    scopes.push({ name: innerQn, startLine, endLine, symbolId: sym.id });
+    innerClasses.push({ qn: innerQn, startLine, endLine });
+  }
+
+  // Check if a line falls inside any inner class range.
+  // Pick the narrowest span so nested inner classes (Outer.Inner.More)
+  // are attributed correctly, not the outer container.
+  const findInnerClass = (line: number): string | null => {
+    let best: { qn: string; span: number } | null = null;
+    for (const ic of innerClasses) {
+      if (line >= ic.startLine && line <= ic.endLine) {
+        const span = ic.endLine - ic.startLine;
+        if (!best || span < best.span) best = { qn: ic.qn, span };
+      }
+    }
+    return best?.qn ?? null;
+  };
+
+  // ── Extract function definitions ────────────────────────────────────
+  for (const fn of safeFindAll(root, "function_definition")) {
+    const nameNode = safeFind(fn, "name");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const startLine = lineOf(fn);
+    // If this function is inside an inner class, qualify with the inner class
+    const innerClass = findInnerClass(startLine);
+    const ownerClass = innerClass ?? className;
+    const qn = ownerClass ? `${ownerClass}.${name}` : name;
+    const endLine = endLineOf(fn);
+    const sym: SymbolNode = {
+      id: makeId(file, qn, startLine),
+      name,
+      qualifiedName: qn,
+      kind: ownerClass ? "method" : "function",
+      file,
+      line: startLine,
+      endLine,
+      language,
+    };
+    symbols.push(sym);
+    scopes.push({ name: qn, startLine, endLine, symbolId: sym.id });
+  }
+
+  // ── Extract constructor definitions (_init) ─────────────────────────
+  // The GDScript grammar separates `func _init()` as `constructor_definition`
+  // (no `name` field — the name is the bare token `_init` after `func`, and
+  // its kind() is the name itself, not "identifier").
+  for (const fn of safeFindAll(root, "constructor_definition")) {
+    const kids = kidsOf(fn);
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const funcKwIdx = kids.findIndex((c: any) => c.kind() === "func");
+    const nameNode = funcKwIdx >= 0 && funcKwIdx + 1 < kids.length
+      ? kids[funcKwIdx + 1]
+      : null;
+    if (!nameNode) continue;
+    const name = nameNode.text(); // Always "_init"
+    if (!name || name === "(") continue; // Safety: skip if not a name token
+    const startLine = lineOf(fn);
+    const innerClass = findInnerClass(startLine);
+    const ownerClass = innerClass ?? className;
+    const qn = ownerClass ? `${ownerClass}.${name}` : name;
+    const endLine = endLineOf(fn);
+    const sym: SymbolNode = {
+      id: makeId(file, qn, startLine),
+      name,
+      qualifiedName: qn,
+      kind: "constructor",
+      file,
+      line: startLine,
+      endLine,
+      language,
+    };
+    symbols.push(sym);
+    scopes.push({ name: qn, startLine, endLine, symbolId: sym.id });
+  }
+
+  // ── Extract lambdas (anonymous functions) ───────────────────────────
+  // `var f = func(): pass` or `call(func(): return 42)` — inline callbacks.
+  // These are not named but create a scope so calls inside the lambda body
+  // are attributed to the lambda instead of <module>.
+  for (const lambda of safeFindAll(root, "lambda")) {
+    const startLine = lineOf(lambda);
+    const endLine = endLineOf(lambda);
+    const qn = className
+      ? `${className}.<lambda>#${startLine}`
+      : `<lambda>#${startLine}`;
+    const sym: SymbolNode = {
+      id: makeId(file, qn, startLine),
+      name: `<lambda>#${startLine}`,
+      qualifiedName: qn,
+      kind: "function",
+      file,
+      line: startLine,
+      endLine,
+      language,
+    };
+    symbols.push(sym);
+    scopes.push({ name: qn, startLine, endLine, symbolId: sym.id });
+  }
+
+  // ── Extract typed variables (for receiver-type resolution) ──────────
+  // `var opponent: Fighter` → variable symbol with typeName = "Fighter"
+  // `var health: int = 100` → variable symbol with typeName = "int"
+  // These are not callable symbols but are needed to resolve receiver types
+  // for method calls like `opponent.attack()`.
+  for (const vs of safeFindAll(root, "variable_statement")) {
+    const nameNode = safeFind(vs, "name");
+    const typeNode = kidsOf(vs).find((child) => child.kind() === "type");
+    if (!nameNode || !typeNode) continue;
+    const varName = nameNode.text();
+    const typeName = typeNode.text();
+    // Skip primitive types — they have no methods to resolve
+    // Note: String, Array, Dictionary are builtin classes with methods,
+    // so they are NOT skipped here — they resolve as engine API via
+    // GODOT_BUILTIN_CLASSES during receiver-type resolution.
+    if (["int", "float", "bool", "void", "Nil", "null"].includes(typeName)) continue;
+    const qn = className ? `${className}.${varName}` : varName;
+    const startLine = lineOf(vs);
+    const endLine = startLine; // Variables are single-line for scope purposes
+    const sym: SymbolNode = {
+      id: makeId(file, qn, startLine),
+      name: varName,
+      qualifiedName: qn,
+      kind: "variable",
+      file,
+      line: startLine,
+      endLine,
+      language,
+      typeName,
+    };
+    symbols.push(sym);
+    // Don't add variables as scope frames — they're not callable scopes
+  }
+
+  // ── Extract assignment-site type inferences ─────────────────────────
+  // Two sources:
+  // 1. `variable_statement` with initializer but no type annotation:
+  //    `var x = Fighter.new()` → inferredTypes["x"] = "Fighter"
+  //    `var x = self`          → inferredTypes["x"] = "<self>"
+  //    `var x = opponent`      → inferredTypes["x"] = "ref:opponent"
+  // 2. `assignment` nodes:
+  //    `x = Fighter.new()`     → inferredTypes["x"] = "Fighter"
+  //    `state.member = self`   → memberAssignments.push({receiver, member, valueType})
+  //
+  // These are resolved during Phase 4 (resolveCallSites) where the
+  // classNameIndex and typedVars are available to interpret "<self>" and
+  // "ref:varName" markers.
+  const inferredTypes = new Map<string, Array<{ type: string; startLine: number; endLine: number }>>();
+  const memberAssignments: Array<{ receiver: string; memberName: string; valueType: string }> = [];
+
+  // Helper: find the enclosing scope's line range for a given line.
+  // Returns the deepest function/class scope containing the line, or
+  // the module scope (entire file) if no function scope is found.
+  const findScopeRange = (line: number): { startLine: number; endLine: number } => {
+    let best: { startLine: number; endLine: number } | null = null;
+    let bestSpan = Infinity;
+    for (const s of scopes) {
+      if (line >= s.startLine && line <= s.endLine) {
+        const span = s.endLine - s.startLine;
+        if (span < bestSpan) {
+          bestSpan = span;
+          best = { startLine: s.startLine, endLine: s.endLine };
+        }
+      }
+    }
+    return best ?? { startLine: 1, endLine: totalLines };
+  };
+
+  // Helper: record an inferred type with scope info.
+  const recordInferred = (varName: string, type: string, line: number) => {
+    const scope = findScopeRange(line);
+    let arr = inferredTypes.get(varName);
+    if (!arr) {
+      arr = [];
+      inferredTypes.set(varName, arr);
+    }
+    // Replace any existing inference in the same scope (last-writer-wins
+    // within a scope), or add a new one.
+    const existingIdx = arr.findIndex((e) => e.startLine === scope.startLine && e.endLine === scope.endLine);
+    if (existingIdx >= 0) {
+      arr[existingIdx] = { type, ...scope };
+    } else {
+      arr.push({ type, ...scope });
+    }
+  };
+
+  // Helper: infer type from an RHS expression node.
+  // Returns a type name, "<self>", or "ref:varName".
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const inferTypeFromExpr = (exprNode: any): string | null => {
+    if (!exprNode) return null;
+    // self → special marker (resolved to file's className during resolution)
+    if (exprNode.kind() === "identifier" && exprNode.text() === "self") return "<self>";
+    // Builtin type literals → infer the builtin type
+    if (exprNode.kind() === "array") return "Array";
+    if (exprNode.kind() === "dictionary") return "Dictionary";
+    if (exprNode.kind() === "string") return "String";
+    if (exprNode.kind() === "integer") return "int";
+    if (exprNode.kind() === "float") return "float";
+    // ClassName.new() → attribute with attribute_call method "new"
+    if (exprNode.kind() === "attribute") {
+      const attrCall = exprNode.find({ rule: { kind: "attribute_call" } });
+      if (attrCall) {
+        const methodId = attrCall.find({ rule: { kind: "identifier" } });
+        if (methodId?.text() === "new") {
+          // The receiver is the first child of the attribute (before the dot).
+          // Only infer a type if the receiver is a plain identifier (class name).
+          // If it's a call (preload(...), load(...)) or other expression, we
+          // can't determine the type without resolving the script path.
+          const receiverNode = kidsOf(exprNode)[0];
+          if (receiverNode?.kind() === "identifier") {
+            const receiverName = receiverNode.text();
+            // Skip builtin function names used as static callers
+            if (receiverName !== "preload" && receiverName !== "load") {
+              return receiverName;
+            }
+          }
+        }
+      }
+      return null;
+    }
+    // Bare identifier → reference to another variable
+    if (exprNode.kind() === "identifier") {
+      const name = exprNode.text();
+      // Skip keywords and builtins
+      if (["true", "false", "null"].includes(name)) return null;
+      return `ref:${name}`;
+    }
+    return null;
+  };
+
+  // 1. variable_statement with initializer
+  //    Captures inferred types for both untyped vars (P1) and typed vars (P2).
+  //    For typed vars, the inferred type is used for widened-annotation
+  //    narrowing during resolution (prefer runtime type over declared base).
+  for (const vs of safeFindAll(root, "variable_statement")) {
+    const nameNode = safeFind(vs, "name");
+    if (!nameNode) continue;
+    const varName = nameNode.text();
+    // Find the initializer expression (child after "=")
+    const kids = kidsOf(vs);
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const eqIdx = kids.findIndex((c: any) => c.kind() === "=");
+    if (eqIdx < 0 || eqIdx + 1 >= kids.length) continue;
+    const exprNode = kids[eqIdx + 1];
+    const inferred = inferTypeFromExpr(exprNode);
+    if (inferred) recordInferred(varName, inferred, lineOf(vs));
+  }
+
+  // 2. assignment nodes
+  for (const a of safeFindAll(root, "assignment")) {
+    const kids = kidsOf(a);
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const eqIdx = kids.findIndex((c: any) => c.kind() === "=");
+    if (eqIdx < 0 || eqIdx + 1 >= kids.length) continue;
+    const lhs = kids[0];
+    const rhs = kids[eqIdx + 1];
+    const inferred = inferTypeFromExpr(rhs);
+    if (!inferred) continue;
+
+    if (lhs.kind() === "identifier") {
+      // Simple assignment: x = Expr
+      recordInferred(lhs.text(), inferred, lineOf(a));
+    } else if (lhs.kind() === "attribute") {
+      // Member assignment: receiver.member = Expr
+      // The attribute has identifiers: receiver and member name
+      // The first identifier is the receiver, the last is the member
+      const lhsKids = kidsOf(lhs);
+      const allIds = lhsKids.filter(
+        // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+        (c: any) => c.kind() === "identifier",
+      );
+      if (allIds.length === 2) {
+        const receiver = allIds[0].text();
+        const memberName = allIds[1].text();
+        memberAssignments.push({ receiver, memberName, valueType: inferred });
+      }
+      // Single-identifier attributes shouldn't occur for assignments — skip.
+    }
+  }
+
+  // ── Extract signals ─────────────────────────────────────────────────
+  // `signal hit_landed(damage: int)` → signal symbol, callable via .emit()
+  // `signal died` → signal symbol
+  for (const sig of safeFindAll(root, "signal_statement")) {
+    const nameNode = safeFind(sig, "name");
+    if (!nameNode) continue;
+    const sigName = nameNode.text();
+    const qn = className ? `${className}.${sigName}` : sigName;
+    const startLine = lineOf(sig);
+    const endLine = startLine;
+    const sym: SymbolNode = {
+      id: makeId(file, qn, startLine),
+      name: sigName,
+      qualifiedName: qn,
+      kind: "signal",
+      file,
+      line: startLine,
+      endLine,
+      language,
+    };
+    symbols.push(sym);
+  }
+
+  // ── Extract enums and their members ─────────────────────────────────
+  // `enum State { IDLE, WALK, ATTACK }` → enum symbol + constant per member
+  // `enum { RED, GREEN, BLUE }` → anonymous enum, constants only
+  for (const en of safeFindAll(root, "enum_definition")) {
+    const nameNode = safeFind(en, "name");
+    const enumName = nameNode?.text() ?? null;
+    const startLine = lineOf(en);
+    const endLine = endLineOf(en);
+
+    if (enumName) {
+      const qn = className ? `${className}.${enumName}` : enumName;
+      const sym: SymbolNode = {
+        id: makeId(file, qn, startLine),
+        name: enumName,
+        qualifiedName: qn,
+        kind: "enum",
+        file,
+        line: startLine,
+        endLine,
+        language,
+      };
+      symbols.push(sym);
+    }
+
+    // Extract enum members as constants
+    for (const enumerator of safeFindAll(en, "enumerator")) {
+      const idNode = safeFind(enumerator, "identifier");
+      if (!idNode) continue;
+      const memberName = idNode.text();
+      // Qualified as EnumName.MEMBER or just MEMBER for anonymous enums
+      const qn = enumName
+        ? (className ? `${className}.${enumName}.${memberName}` : `${enumName}.${memberName}`)
+        : memberName;
+      const memberLine = lineOf(enumerator);
+      const sym: SymbolNode = {
+        id: makeId(file, qn, memberLine),
+        name: memberName,
+        qualifiedName: qn,
+        kind: "constant",
+        file,
+        line: memberLine,
+        endLine: memberLine,
+        language,
+      };
+      symbols.push(sym);
+    }
+  }
+
+  // ── Extract constants ───────────────────────────────────────────────
+  // `const MAX_HEALTH = 100` → constant symbol
+  // `const SPEED: float = 500.0` → constant symbol with typeName
+  for (const cs of safeFindAll(root, "const_statement")) {
+    const nameNode = safeFind(cs, "name");
+    if (!nameNode) continue;
+    const constName = nameNode.text();
+    const qn = className ? `${className}.${constName}` : constName;
+    const startLine = lineOf(cs);
+    const endLine = startLine;
+    const typeNode = kidsOf(cs).find((child) => child.kind() === "type");
+    const sym: SymbolNode = {
+      id: makeId(file, qn, startLine),
+      name: constName,
+      qualifiedName: qn,
+      kind: "constant",
+      file,
+      line: startLine,
+      endLine,
+      language,
+      ...(typeNode ? { typeName: typeNode.text() } : {}),
+    };
+    symbols.push(sym);
+  }
+
+  // ── Extract calls ───────────────────────────────────────────────────
+  // GDScript has two call forms:
+  //   1. `call` node: bare function call — emit calleeName only
+  //   2. `attribute` node containing `attribute_call`: method call —
+  //      emit calleeName + receiver (the identifier before the dot)
+  // GDScript keywords only — NOT Godot builtin functions. Builtin function
+  // names (print, push_error, etc.) are filtered at resolution time after
+  // local lookup, so a user-defined `func print()` can shadow the engine builtin.
+  // `emit` and `connect` are handled in the attribute-call path above for
+  // signal emit/connect; as bare calls they're meaningless and will be
+  // filtered by GODOT_BUILTIN_FUNCTIONS at resolution time.
+  const KW = new Set([
+    "if", "for", "while", "return", "func", "class", "var", "const",
+    "signal", "enum", "match", "break", "continue", "pass", "assert",
+    "await", "yield", "and", "or", "not", "in", "as", "is", "elif", "else",
+    "true", "false", "null",
+  ]);
+
+  // Method calls: one attribute can contain several direct attribute_call
+  // children, as in `fighter.get_state().update()`. Process each direct child
+  // exactly once so the inner and terminal methods are both represented.
+  for (const attr of safeFindAll(root, "attribute")) {
+    const attrChildren = kidsOf(attr);
+    const attrCalls = attrChildren.filter((child) => child.kind() === "attribute_call");
+
+    for (const attrCall of attrCalls) {
+      const methodId = safeFind(attrCall, "identifier");
+      if (!methodId) continue;
+      const callee = methodId.text();
+      const callIndex = attrChildren.indexOf(attrCall);
+      const receiverChildren = attrChildren.slice(0, callIndex);
+      const firstChild = receiverChildren[0];
+
+      // Receiver is the expression before this particular method call.
+      // Attribute-call names already traversed become receiver segments, so
+      // the terminal call in `fighter.get_state().update()` has receiver
+      // `fighter.get_state` while the inner call has receiver `fighter`.
+      let receiver: string | null = null;
+      if (firstChild?.kind() === "identifier") {
+        const receiverParts: string[] = [];
+        for (const child of receiverChildren) {
+          if (child.kind() === "identifier") receiverParts.push(child.text());
+          else if (child.kind() === "attribute_call") {
+            const priorMethodId = safeFind(child, "identifier");
+            if (priorMethodId) receiverParts.push(priorMethodId.text());
+          }
+        }
+        receiver = receiverParts.length > 0 ? receiverParts.join(".") : null;
+      } else if (firstChild?.kind() === "get_node") {
+        const gnText = firstChild.text();
+        const nodePath = gnText.startsWith("$")
+          ? gnText.slice(1)
+          : safeFind(firstChild, "string")?.text().replace(/^['"]|['"]$/g, "") ?? null;
+        if (nodePath) {
+          const receiverParts: string[] = [nodePath];
+          for (const child of receiverChildren.slice(1)) {
+            if (child.kind() === "identifier") receiverParts.push(child.text());
+            else if (child.kind() === "attribute_call") {
+              const priorMethodId = safeFind(child, "identifier");
+              if (priorMethodId) receiverParts.push(priorMethodId.text());
+            }
+          }
+          receiver = receiverParts.join(".");
+        }
+      }
+
+      // Signal emit/connect: `signal_name.emit(args)` or
+      // `signal_name.connect(handler)`. The signal is the final identifier
+      // immediately before this call; a preceding method call is dynamic and
+      // cannot safely be treated as a statically named signal.
+      if (callee === "emit" || callee === "connect") {
+        let precedingValue = null;
+        for (let i = receiverChildren.length - 1; i >= 0; i--) {
+          if (receiverChildren[i].kind() !== ".") {
+            precedingValue = receiverChildren[i];
+            break;
+          }
+        }
+        if (precedingValue?.kind() === "identifier") {
+          const signalName = precedingValue.text();
+          if (callee === "emit") {
+            rawCalls.push({
+              calleeName: signalName,
+              kind: "call",
+              callSite: { file, line: lineOf(attr) },
+              callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
+              signalEmit: true,
+            });
+          } else {
+            const args = safeFind(attrCall, "arguments");
+            if (args) {
+              for (const arg of kidsOf(args)) {
+                if (arg.kind() === "identifier") {
+                  rawCalls.push({
+                    calleeName: arg.text(),
+                    kind: "call",
+                    callSite: { file, line: lineOf(attr) },
+                    callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
+                  });
+                  break;
+                }
+                if (arg.kind() === "attribute") {
+                  const argIds = arg.findAll({ rule: { kind: "identifier" } });
+                  if (argIds.length > 0) {
+                    rawCalls.push({
+                      calleeName: argIds[argIds.length - 1].text(),
+                      kind: "call",
+                      receiver: argIds.length > 1 ? argIds[0].text() : undefined,
+                      callSite: { file, line: lineOf(attr) },
+                      callerId: findCallerId(scopes, lineOf(attr), moduleSym.id),
+                    });
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      // Dynamic dispatch on attribute calls uses the first string argument as
+      // the real method or signal name instead of exposing the helper method.
+      if (callee === "call" || callee === "call_deferred" || callee === "emit_signal") {
+        const args = safeFind(attrCall, "arguments");
+        const strNode = args ? safeFind(args, "string") : null;
+        if (strNode) {
+          const methodName = strNode.text().replace(/^['"]|['"]$/g, "");
+          if (methodName && /^[A-Za-z_][\w]*$/.test(methodName)) {
+            const line = lineOf(attr);
+            rawCalls.push({
+              callerId: findCallerId(scopes, line, moduleSym.id),
+              calleeName: methodName,
+              kind: "call",
+              callSite: { file, line },
+              ...(receiver ? { receiver } : {}),
+            });
+          }
+        }
+        continue;
+      }
+
+      const line = lineOf(attr);
+      rawCalls.push({
+        callerId: findCallerId(scopes, line, moduleSym.id),
+        calleeName: callee,
+        kind: "call",
+        callSite: { file, line },
+        ...(receiver ? { receiver } : {}),
+      });
+    }
+  }
+
+  // Bare function calls: call nodes (not inside an attribute)
+  // Includes dynamic dispatch resolution: call("method"), call_deferred("method"),
+  // emit_signal("signal") → extract the string argument as the real callee name.
+  // connect("signal", target, "method") → extract the last string arg as method name.
+  const DYNAMIC_DISPATCH = new Set(["call", "call_deferred", "emit_signal"]);
+  for (const call of safeFindAll(root, "call")) {
+    // Skip calls that are children of attribute nodes (already handled above)
+    const parent = call.parent();
+    if (parent && parent.kind() === "attribute_call") continue;
+    const idNode = safeFind(call, "identifier");
+    if (!idNode) continue;
+    const callee = idNode.text();
+
+    // connect("signal", target, "method") — special case: last string arg is method name
+    // Godot 3 style signal connection, still common in Godot 4 codebases.
+    // `self` is an identifier (not a string), so we collect all string args
+    // and use the last one as the method name: connect("hit", self, "_on_hit")
+    // has 2 strings: "hit" and "_on_hit" → method = "_on_hit".
+    if (callee === "connect") {
+      const args = safeFind(call, "arguments");
+      if (args) {
+        // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+        const strNodes = args.findAll({ rule: { kind: "string" } }).map((n: any) => n);
+        if (strNodes.length >= 2) {
+          const methodName = strNodes[strNodes.length - 1].text().replace(/^['"]|['"]$/g, "");
+          if (methodName && /^[A-Za-z_][\w]*$/.test(methodName)) {
+            const line = lineOf(call);
+            rawCalls.push({
+              callerId: findCallerId(scopes, line, moduleSym.id),
+              calleeName: methodName,
+              kind: "call",
+              callSite: { file, line },
+            });
+            continue;
+          }
+        }
+      }
+      // If connect doesn't match the expected pattern, skip it entirely
+      // (don't emit "connect" as a callee name — it would be unresolved noise)
+      continue;
+    }
+
+    // Dynamic dispatch: extract method/signal name from first string argument.
+    // `call("take_damage", 10)` → calleeName = "take_damage"
+    // `emit_signal("died")` → calleeName = "died"
+    // If the first arg is not a string literal, fall through to normal handling.
+    if (DYNAMIC_DISPATCH.has(callee)) {
+      const args = safeFind(call, "arguments");
+      if (args) {
+        const strNode = safeFind(args, "string");
+        if (strNode) {
+          // Strip quotes (single or double) from the string literal
+          const methodName = strNode.text().replace(/^['"]|['"]$/g, "");
+          if (methodName && /^[A-Za-z_][\w]*$/.test(methodName)) {
+            const line = lineOf(call);
+            rawCalls.push({
+              callerId: findCallerId(scopes, line, moduleSym.id),
+              calleeName: methodName,
+              kind: "call",
+              callSite: { file, line },
+            });
+            continue;
+          }
+        }
+      }
+      // String arg not found — skip dynamic dispatch calls rather than
+      // emitting "call"/"emit_signal" as callee names (they'd be unresolved).
+      continue;
+    }
+
+    if (KW.has(callee)) continue;
+    const line = lineOf(call);
+    rawCalls.push({
+      callerId: findCallerId(scopes, line, moduleSym.id),
+      calleeName: callee,
+      kind: "call",
+      callSite: { file, line },
+    });
+  }
+
+  return { symbols, rawCalls, inferredTypes, memberAssignments };
+}
+
 // ── Regex fallback (Dart, Lua, Svelte/Vue, anything unsupported) ────────
 
 function extractFromRegex(
@@ -2795,5 +3722,7 @@ export function rawCallsToUnresolvedEdges(
     localAlias: c.localAlias,
     calleeQualifier: c.calleeQualifier,
     callSite: c.callSite,
+    ...(c.receiver ? { receiver: c.receiver } : {}),
+    ...(c.signalEmit ? { signalEmit: true } : {}),
   }));
 }
