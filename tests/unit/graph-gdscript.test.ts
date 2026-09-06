@@ -17,6 +17,7 @@ import {
   resolveImport,
 } from "../../src/services/graph-resolution.js";
 import { chunkFileContent } from "../../src/services/indexer.js";
+import { setGdscriptParserAvailable } from "../../src/services/parser-availability.js";
 
 // Register before test declarations so skipIf observes the final availability state.
 ensureDynamicLanguages();
@@ -1167,7 +1168,7 @@ func setup():
       expect(failed).toBeUndefined();
     });
 
-    it.skipIf(!gdscriptParserAvailable)("other dynamic languages are not affected by GDScript registration", () => {
+    it("other dynamic languages are not affected by GDScript registration", () => {
       // GDScript registration must not wipe out other dynamic languages.
       // registerDynamicLanguage replaces all languages on each call, so
       // GDScript must be in the same batch, not a separate one.
@@ -1232,11 +1233,6 @@ func setup():
       expect(specs).toContain("res://scripts/Helper.gd");
     });
 
-    it.skipIf(!gdscriptParserAvailable)("regex fallback is not advertised as full support", () => {
-      // When gdscriptParserAvailable is true, the regex fallback should not
-      // be used. This test documents that the AST path is active.
-      expect(gdscriptParserAvailable).toBe(true);
-    });
   });
 
   // ── Regex fallback tests (when native parser is unavailable) ───────────
@@ -1282,20 +1278,23 @@ func setup():
     });
 
     it("extractImports uses regex fallback when native parser is unavailable", () => {
-      // This test documents the fallback path in extractImports.
-      // When gdscriptParserAvailable is false, extractImports delegates
-      // to extractGdscriptImportsRegex. We test the regex function directly
-      // since we cannot force the parser to be unavailable in this env.
-      const source = 'preload("res://test.gd")';
-      const regexResult = extractGdscriptImportsRegex(source);
-      const extractResult = gdscriptParserAvailable
-        ? extractGdscriptImportsRegex(source) // same path when parser unavailable
-        : extractImports(source, "gdscript", ".gd");
+      const source = [
+        '# preload("res://comment.gd")',
+        'extends "res://scripts/Base.gd"',
+        'preload("res://scripts/Helper.gd")',
+      ].join("\n");
+      const originalAvailability = gdscriptParserAvailable;
 
-      // Both should extract the same import
-      expect(regexResult.map((i) => i.moduleSpecifier)).toEqual(
-        extractResult.map((i) => i.moduleSpecifier),
-      );
+      setGdscriptParserAvailable(false);
+      try {
+        const imports = extractImports(source, "gdscript", ".gd");
+        expect(imports.map((item) => item.moduleSpecifier)).toEqual([
+          "res://scripts/Base.gd",
+          "res://scripts/Helper.gd",
+        ]);
+      } finally {
+        setGdscriptParserAvailable(originalAvailability);
+      }
     });
   });
 
