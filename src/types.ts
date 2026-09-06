@@ -169,6 +169,18 @@ export interface SymbolEdge {
    * or the exported alias for re-export edges (e.g. `Y` in `export { X as Y }` or `export * as Y from './mod'`).
    */
   localAlias?: string;
+  /**
+   * The path qualifying the callee at the call site, terminal name excluded:
+   * `Vec` in `Vec::new()`, `std::fs` in `std::fs::copy()`. Absent on a bare
+   * call, and absent from every graph persisted before it existed — resolution
+   * treats an edge without one exactly as it always did.
+   *
+   * It is kept because the name alone cannot be resolved safely: `new` names
+   * 191 symbols on tokio, so a qualified call matched by name would either
+   * pick one arbitrarily or list them all. With the qualifier, resolution can
+   * narrow to the scope the call actually names, or say it could not.
+   */
+  calleeQualifier?: string;
   callSite: { file: string; line: number };
 }
 

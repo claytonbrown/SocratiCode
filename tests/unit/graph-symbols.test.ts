@@ -349,12 +349,142 @@ impl A { pub const MAX: u32 = 9; }
 `;
       const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
       const outs = out.symbols.filter((s) => s.name === "Out");
-      expect(outs).toHaveLength(2);
+      // Three: the trait's own declaration, and one per impl.
+      expect(outs).toHaveLength(3);
       expect(outs.every((s) => s.kind === "type")).toBe(true);
+      expect(outs.map((s) => s.line)).toEqual([2, 5, 6]);
       expect(out.symbols.some((s) => s.name === "MAX" && s.kind === "variable")).toBe(true);
-      // The trait's own declaration is an `associated_type`, not a `type_item`,
-      // so the declaration a reader looks for is the one that is missing.
-      expect(out.symbols.filter((s) => s.name === "Out").every((s) => s.line > 4)).toBe(true);
+    });
+
+    it("reads a declaration that has no body, in a trait and in an extern block", () => {
+      // A declaration without a definition is still what a reader looks up.
+      // Rust writes both as `function_signature_item`, and a trait's own
+      // associated type as `associated_type` — a different node from the
+      // `type_item` an impl writes, which is why reading definitions alone left
+      // a trait's contents unfindable.
+      const src = `
+pub trait Speaks {
+    fn say(&self) -> u32;
+    type Voice;
+}
+extern "C" {
+    pub fn c_open(path: u32) -> u32;
+    pub static C_LIMIT: u32;
+}
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const byName = new Map(out.symbols.map((s) => [s.name, s.kind]));
+      expect(byName.get("say")).toBe("function");
+      expect(byName.get("Voice")).toBe("type");
+      expect(byName.get("c_open")).toBe("function");
+      expect(byName.get("C_LIMIT")).toBe("variable");
+      // The kind is `function` because that is what every Rust `fn` gets here,
+      // an impl's methods included; a declared one is not a different species.
+      expect(out.symbols.find((s) => s.name === "say")?.line).toBe(3);
+    });
+
+    it("reads a qualified call as a terminal name plus its qualifier", () => {
+      // `extractCalleeNameJs` matched the chain pattern `[\w$.]+`, which stops
+      // at the `:` of `::`, so every one of these produced no edge at all.
+      const src = `
+fn f() {
+    let _ = plain();
+    let _ = obj.method();
+    let _ = Vec::new();
+    let _ = std::fs::copy(a, b);
+    let _ = Vec::<u8>::new();
+    let _ = Vec::<Option<u8>>::with_capacity(1);
+    let _ = self::helper();
+    let _ = crate::a::b::run();
+}
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const seen = out.rawCalls.map((c) => `${c.calleeQualifier ?? ""}|${c.calleeName}`);
+      expect(seen).toContain("|plain");
+      // A method on a receiver has no path to narrow with: the name is all it knows.
+      expect(seen).toContain("|method");
+      expect(seen).toContain("Vec|new");
+      expect(seen).toContain("std::fs|copy");
+      // The turbofish is not part of the qualifier, and a nested generic must
+      // not leave a stray `>` behind.
+      expect(seen).toContain("Vec|new");
+      expect(seen).toContain("Vec|with_capacity");
+      expect(seen).toContain("self|helper");
+      expect(seen).toContain("crate::a::b|run");
+    });
+
+    it("reads every link of a chain whose head is qualified", () => {
+      // The whole chain used to yield nothing: ast-grep reports one node per
+      // link and each node's text begins at the head, so the text-level
+      // extractor died on the head's `::` for every link.
+      const src = "fn f() { let _ = Path::new(p).components().all(g); }";
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const seen = out.rawCalls.map((c) => `${c.calleeQualifier ?? ""}|${c.calleeName}`);
+      expect(seen).toContain("Path|new");
+      expect(seen).toContain("|components");
+      expect(seen).toContain("|all");
+    });
+
+    it("does not invent a callee for a form it cannot read", () => {
+      // `<T as Tr>::go()` is a qualified path with syntax in it. It yields an
+      // edge named `go`, qualified by text that resolution will refuse — which
+      // is the point: an edge that says what it saw, not a guess.
+      const src = "fn f() { let _ = <T as Tr>::go(); }";
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const go = out.rawCalls.find((c) => c.calleeName === "go");
+      expect(go).toBeDefined();
+      expect(go?.calleeQualifier).toBe("<T as Tr>");
+    });
+
+    it("collects the name each use puts in scope, alias included", () => {
+      // The file graph cannot supply this: `rustUseLeafPath` strips ` as X`
+      // before the path is recorded, so `Alias` names nothing downstream.
+      const src = `
+use crate::a::Type as Alias;
+use crate::a::{Thing, Other as O};
+use std::fs;
+use crate::b::{self, Deep};
+use crate::c::*;
+use self as ThisModule;
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const bindings = new Map((out.bindings ?? []).map((b) => [b.local, b.path]));
+      expect(bindings.get("Alias")).toBe("crate::a::Type");
+      expect(bindings.get("Thing")).toBe("crate::a::Thing");
+      expect(bindings.get("O")).toBe("crate::a::Other");
+      expect(bindings.get("fs")).toBe("std::fs");
+      // `self` in a list binds the prefix's own last segment.
+      expect(bindings.get("b")).toBe("crate::b");
+      expect(bindings.get("Deep")).toBe("crate::b::Deep");
+      // At the file top level, bare `self` names the file's own module. It must
+      // keep that anchor rather than becoming an empty path.
+      expect(bindings.get("ThisModule")).toBe("self");
+      // A wildcard binds no name: what it brings in cannot be known from this
+      // file, and guessing would widen resolution instead of narrowing it.
+      expect(bindings.has("c")).toBe(false);
+    });
+
+    it("does not let a use written inside a scope bind the whole file", () => {
+      // A `use` inside a `fn` or a `mod x { }` names something *there*. Taken
+      // for the file's own, it would point a call in a different scope at a
+      // different type — and resolution would state that as `unique`, which is
+      // worse than saying nothing. `safeFindAll` walks the whole tree, so this
+      // is what reading the file's top level rather than searching prevents.
+      const src = `
+use crate::a::Thing;
+
+pub fn scoped() {
+    use crate::b::Thing;
+    let _ = Thing::make();
+}
+
+mod inner {
+    use crate::c::Thing;
+}
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const paths = (out.bindings ?? []).filter((b) => b.local === "Thing").map((b) => b.path);
+      expect(paths).toEqual(["crate::a::Thing"]);
     });
   });
 

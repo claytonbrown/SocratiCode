@@ -20,7 +20,12 @@ import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
 import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotRootForFile, type GodotUidIndex, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
-import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
+import {
+  extractSymbolsAndCalls,
+  type RustUseBinding,
+  rawCallsToUnresolvedEdges,
+} from "./graph-symbols.js";
+
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { logger } from "./logger.js";
 import { deleteGraphData, describeQdrantError, getGraphMetadata, loadGraphData, saveGraphData } from "./qdrant.js";
@@ -248,7 +253,16 @@ async function doRebuildGraph(
     if (!opts.skipSymbolGraph) {
       try {
         progress.phase = "resolving symbols";
-        resolveCallSites(graph, built.symbolsByFile, built.outgoingCallsByFile);
+        resolveCallSites(
+          graph,
+          built.symbolsByFile,
+          built.outgoingCallsByFile,
+          built.rustBindingsByFile,
+          built.rustCrateRootByFile,
+          built.rustInlineScopedCalls,
+          built.rustInlineDeclaredSymbols,
+          built.rustCrateRootsByFile,
+        );
 
         progress.phase = "persisting symbols";
         await persistSymbolGraph(projectId, resolvedPath, built.symbolsByFile, built.outgoingCallsByFile);
@@ -915,6 +929,24 @@ export async function buildCodeGraph(
 ): Promise<CodeGraph & {
   symbolsByFile: Map<string, SymbolNode[]>;
   outgoingCallsByFile: Map<string, SymbolEdge[]>;
+  /** Rust `use` bindings per file — resolution input only, never persisted. */
+  rustBindingsByFile: Map<string, RustUseBinding[]>;
+  /** Rust file → its crate's directory prefix. Resolution input only. */
+  rustCrateRootByFile: Map<string, string>;
+  /** Rust file → every target root its parsed Cargo manifest declares. */
+  rustCrateRootsByFile: Map<string, string[]>;
+  /**
+   * The call edges whose qualifier is rooted in an inline `mod` — a scope with
+   * no file to name. Resolution leaves them unresolved. Held by identity, so
+   * nothing about it reaches an edge or the store.
+   */
+  rustInlineScopedCalls: Set<SymbolEdge>;
+  /**
+   * The ids of the Rust symbols declared inside an inline `mod`. A path
+   * anchored at a file's own module cannot reach them, so resolution drops
+   * them from that path's candidates. Resolution input only, never persisted.
+   */
+  rustInlineDeclaredSymbols: Map<string, string>;
 }> {
   ensureDynamicLanguages();
 
@@ -957,6 +989,9 @@ export async function buildCodeGraph(
   const edges: CodeGraphEdge[] = [];
   const symbolsByFile = new Map<string, SymbolNode[]>();
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
+  const rustBindingsByFile = new Map<string, RustUseBinding[]>();
+  const rustInlineScopedCalls = new Set<SymbolEdge>();
+  const rustInlineDeclaredSymbols = new Map<string, string>();
 
   // Per-reason counts, holding only the reasons that actually fired — the build log
   // emits `skipReasons` straight from this map, so it never carries a zero.
@@ -1068,6 +1103,36 @@ export async function buildCodeGraph(
   // resolving from the file's own position, as before.
   const hasRust = files.some((f) => path.extname(f).toLowerCase() === ".rs");
   const rustCrates = hasRust ? buildRustCrateMap(fileSet, resolvedPath) : undefined;
+
+  // Which crate each Rust file belongs to, as a path prefix. `crate::` is
+  // relative to a crate's own root module, so resolution needs the boundary —
+  // and the manifests are what draw it. Deriving it from the path instead
+  // means guessing at a layout: a marker like `src/` misses a crate that has
+  // no `src/` directory (ripgrep) and misreads one whose sources start at the
+  // project root (tokio), and the guess fails silently in both.
+  //
+  // The owning crate is the one whose directory contains the file and is
+  // deepest, with the workspace root at `"."` ranking as no depth at all —
+  // the same rule the import resolver settled on. A crate at the root confines
+  // nothing, which is correct: there is only one crate to be in.
+  const rustCrateRootByFile = new Map<string, string>();
+  const rustCrateRootsByFile = new Map<string, string[]>();
+  if (rustCrates && rustCrates.length > 0) {
+    const depthOf = (crate: { dir: string }): number => (crate.dir === "." ? 0 : crate.dir.length);
+    const ranked = [...rustCrates].sort((a, b) => depthOf(b) - depthOf(a));
+    for (const relPath of files) {
+      if (!relPath.endsWith(".rs")) continue;
+      const owner = ranked.find((c) => c.dir === "." || relPath.startsWith(`${c.dir}/`));
+      if (owner) {
+        rustCrateRootByFile.set(relPath, owner.dir === "." ? "" : `${owner.dir}/`);
+        // Only a parsed manifest is complete enough to make absence a verdict.
+        // An unreadable manifest contributes convention roots for import
+        // recovery, but those roots must not hide a custom target it could not
+        // declare to us.
+        if (!owner.manifestUnread) rustCrateRootsByFile.set(relPath, [...owner.roots]);
+      }
+    }
+  }
 
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
@@ -1187,7 +1252,24 @@ export async function buildCodeGraph(
     try {
       const extracted = extractSymbolsAndCalls(source, extractionLang, ext, relPath);
       symbolsByFile.set(relPath, extracted.symbols);
-      outgoingCallsByFile.set(relPath, rawCallsToUnresolvedEdges(extracted.rawCalls));
+      const edges = rawCallsToUnresolvedEdges(extracted.rawCalls);
+      outgoingCallsByFile.set(relPath, edges);
+      // One edge per raw call, in order, so the call at `i` is the edge at `i`.
+      // The flag stays out of the edge itself: it is resolution's business and
+      // the store must not grow a field for it.
+      for (let i = 0; i < extracted.rawCalls.length; i++) {
+        if (extracted.rawCalls[i].qualifierRootedInInlineMod) rustInlineScopedCalls.add(edges[i]);
+      }
+      // Same reason, one level down: which declarations sit inside an inline
+      // `mod` is visible in the extractor and nowhere after it.
+      if (extracted.inlineModSymbolIds) {
+        for (const [id, owner] of extracted.inlineModSymbolIds) {
+          rustInlineDeclaredSymbols.set(id, owner);
+        }
+      }
+      if (extracted.bindings && extracted.bindings.length > 0) {
+        rustBindingsByFile.set(relPath, extracted.bindings);
+      }
     } catch (err) {
       logger.debug("Symbol extraction failed (continuing)", {
         file: relPath,
@@ -1307,5 +1389,10 @@ export async function buildCodeGraph(
     edges,
     symbolsByFile,
     outgoingCallsByFile,
+    rustBindingsByFile,
+    rustCrateRootByFile,
+    rustCrateRootsByFile,
+    rustInlineScopedCalls,
+    rustInlineDeclaredSymbols,
   };
 }

@@ -14,6 +14,25 @@ import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templ
 import { logger } from "./logger.js";
 
 /** Result of extracting symbols + raw call sites from a file. */
+/**
+ * One name a Rust `use` puts in a file's own scope, and the path it names.
+ *
+ * The file-import graph cannot supply this: `rustUseLeafPath` strips the alias
+ * before the path is ever recorded, and `ImportInfo` has no field for a local
+ * binding. Without it, `use crate::a::Type as Alias;` followed by
+ * `Alias::method()` leaves the qualifier `Alias` naming nothing.
+ *
+ * Kept out of the persisted graph on purpose. It is an input to resolution,
+ * which runs once per full build and in the same process as extraction, so
+ * nothing needs to store it and no payload changes shape.
+ */
+export interface RustUseBinding {
+  /** The name written in this file — the alias when there is one. */
+  local: string;
+  /** The path it names, alias excluded: `crate::a::Type`, `std::fs`. */
+  path: string;
+}
+
 export interface ExtractedSymbols {
   symbols: SymbolNode[];
   /** Outgoing call sites — `calleeCandidates` and `confidence` are filled later by resolution. */
@@ -24,8 +43,34 @@ export interface ExtractedSymbols {
     sourceModule?: string;
     importedName?: string;
     localAlias?: string;
+    /**
+     * The path qualifying the callee, terminal name excluded: `Vec` in
+     * `Vec::new()`, `std::fs` in `std::fs::copy()`. Absent on a bare call.
+     */
+    calleeQualifier?: string;
+    /**
+     * The qualifier is rooted in an inline `mod`, which has no file to point
+     * at and no spelling resolution can follow. Set only for Rust, and only
+     * for the shape that cannot be rewritten as file-relative; resolution
+     * leaves such a call unresolved rather than answering out of the wrong
+     * scope. In memory only — it reaches resolution beside the edges and is
+     * never part of one.
+     */
+    qualifierRootedInInlineMod?: boolean;
     callSite: { file: string; line: number };
   }>;
+  /** Rust `use` bindings declared by this file. Absent for every other language. */
+  bindings?: RustUseBinding[];
+  /**
+   * The ids of the symbols this file declares *inside* an inline `mod` — the
+   * ones a path anchored at the file's own module cannot reach. Set only for
+   * Rust, and only for the files that have any.
+   *
+   * In memory only, like `qualifierRootedInInlineMod`: it reaches resolution
+   * beside the symbols and is never a field on one, so nothing about it is
+   * persisted and a graph built before this still reads.
+   */
+  inlineModSymbolIds?: Array<[id: string, inlineModPath: string]>;
 }
 
 /** Build a stable SymbolNode.id. */
@@ -1733,6 +1778,251 @@ function extractFromGo(
 
 // ── Rust ─────────────────────────────────────────────────────────────────
 
+/**
+ * Every name a file's `use` declarations put in its own scope, paired with the
+ * path each names. Walked over the tree rather than over the text, because the
+ * alias is what is wanted and the text-level helpers in `graph-imports.ts`
+ * delete it: `rustUseLeafPath` strips ` as X` before returning the path.
+ *
+ * A nested list carries its prefix down (`use a::{b, c as d}` binds `b` to
+ * `a::b` and `d` to `a::c`), and `self` in a list binds the prefix's own last
+ * segment (`use a::{self}` binds `a`). A wildcard binds no name and is skipped:
+ * what it brings into scope cannot be known from this file alone, and guessing
+ * would widen resolution rather than narrow it.
+ */
+/**
+ * A path with its turbofish removed: `Vec::<Option<u8>>` → `Vec`. Scanned for
+ * the matching `>` rather than matched with `::<[^>]*>`, which stops at the
+ * first `>` and leaves a stray one behind on a nested generic.
+ */
+function stripTurbofish(path: string): string {
+  let out = "";
+  for (let i = 0; i < path.length; i++) {
+    if (path[i] === ":" && path.slice(i, i + 3) === "::<") {
+      let depth = 0;
+      let j = i + 2;
+      for (; j < path.length; j++) {
+        if (path[j] === "<") depth++;
+        else if (path[j] === ">" && --depth === 0) break;
+      }
+      i = j;
+      continue;
+    }
+    out += path[i];
+  }
+  return out;
+}
+
+/**
+ * The callee of a Rust call, split into the terminal name and the path that
+ * qualifies it. Read off the `function` field rather than scanned out of the
+ * node's text, which is what `extractCalleeNameJs` did and why every qualified
+ * call was dropped: its chain pattern `[\w$.]+` stops dead at the `:` of `::`.
+ *
+ * A chain needs no special case here. ast-grep reports one `call_expression`
+ * per link, and each link's own `function` field names only that link, so
+ * `Path::new(p).components().all(f)` yields `all`, `components` and `new`
+ * rather than nothing.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function extractCalleeInfoRust(fn: any): { name: string; qualifier?: string } | null {
+  if (!fn) return null;
+  switch (fn.kind()) {
+    case "identifier":
+      return { name: fn.text() };
+    // `obj.method()` — the receiver is an expression, not a path, so there is
+    // nothing to narrow with. The name alone is what this call knows.
+    case "field_expression": {
+      const field = fn.field("field");
+      return field ? { name: field.text() } : null;
+    }
+    case "scoped_identifier": {
+      const name = fn.field("name");
+      if (!name) return null;
+      const path = fn.field("path");
+      const qualifier = path ? stripTurbofish(path.text()).trim() : "";
+      return qualifier ? { name: name.text(), qualifier } : { name: name.text() };
+    }
+    // `foo::<T>()` — the turbofish sits on the function itself.
+    case "generic_function":
+      return extractCalleeInfoRust(fn.field("function"));
+    default:
+      return null;
+  }
+}
+
+/**
+ * How many inline `mod`s a node is written inside. Zero means the file's own
+ * module, which is the one resolution can name.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function rustInlineModDepth(node: any): number {
+  let depth = 0;
+  for (let p = node.parent(); p; p = p.parent()) {
+    if (p.kind() === "mod_item") depth += 1;
+  }
+  return depth;
+}
+
+/**
+ * The full path of inline `mod`s around a node, outermost first, or `null`
+ * when there is none.
+ *
+ * The whole path matters to re-exports: `pub use imp::*;` carries direct
+ * exports from `imp`, but it does not flatten a private `imp::hidden` module
+ * into the file's top level.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function rustInlineModPath(node: any): string | null {
+  const modules: string[] = [];
+  for (let p = node.parent(); p; p = p.parent()) {
+    if (p.kind() !== "mod_item") continue;
+    const nameNode = p.field("name");
+    if (nameNode) modules.unshift(nameNode.text());
+  }
+  return modules.length > 0 ? modules.join("::") : null;
+}
+
+/**
+ * A qualifier rewritten as the file itself would have written it.
+ *
+ * `super` counts modules, not files, and an inline `mod` is a module: inside
+ * `#[cfg(test)] mod tests { … }` written in `b.rs`, `super::helper()` means
+ * `b.rs`'s own `helper`, and `super::super::sub::f()` means the `sub` of
+ * `b.rs`'s parent. Resolution knows only files, so it would read both as
+ * relative to the file and answer with the parent's `helper` and the
+ * grandparent's `sub` — not a wider answer, a different one.
+ *
+ * The hops an inline `mod` already accounts for are consumed here, where the
+ * nesting is still visible. A path consumed to nothing is `self`, which is
+ * what it then means. A path with segments left over is written bare, the way
+ * the file itself would write it: bare is the file's own namespace, which is
+ * both its child modules and the names its `use` declarations bring in, and
+ * `self::` would be read as the modules alone.
+ *
+ * `rootedInInlineMod` says the rewrite could not be made: the path never
+ * climbed out of the inline modules, and what it is rooted in has no file.
+ * The qualifier then comes back as it was written, for a reader, and
+ * resolution refuses it rather than answering out of a scope that is not the
+ * one the path names.
+ *
+ * A `self::` path written inside an inline `mod` is rooted the same way and is
+ * refused the same way. `self` is the module the path is written in, so inside
+ * `mod tests { … }` it is `tests` — checked against rustc, where
+ * `self::helper()` beside a `mod tests`-level `helper` calls that one and not
+ * the file's. `tests` has no file, so this is the same refusal, not a new one.
+ * Lowercase only: `Self::` is the implementing type, not a module, and
+ * `Self::poll()` inside a `#[cfg(test)] mod tests` is a call this still
+ * answers.
+ */
+function rustQualifierFromFile(
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  node: any,
+  qualifier: string,
+): { qualifier: string; rootedInInlineMod: boolean } {
+  const asWritten = { qualifier, rootedInInlineMod: false };
+  const segments = qualifier.split("::");
+  if (segments[0] !== "super" && segments[0] !== "self") return asWritten;
+
+  const inlineMods = rustInlineModDepth(node);
+  if (inlineMods === 0) return asWritten;
+  if (segments[0] === "self") return { qualifier, rootedInInlineMod: true };
+
+  let consumed = 0;
+  while (consumed < inlineMods && segments[consumed] === "super") consumed += 1;
+
+  // Fewer `super` than inline modules: the path never climbed out of them, so
+  // it is rooted in a module that lives inside this file and has no file of
+  // its own to name. `mod a { mod b { super::c::f() } }` means the `c` beside
+  // `b`, and writing what is left bare hands it to a `mod c;` on the file —
+  // another file entirely, answered as `unique`.
+  //
+  // Answering with the file instead is no better: the file holds the sibling
+  // inline modules too, so `super::helper()` would collect a `helper` that
+  // Rust cannot see from there and hand it to whoever walks the candidates.
+  // Nothing here can name that scope — a path may even be rooted at a file
+  // module an inline module declares, since `mod a { pub mod c; }` in `x.rs`
+  // is `x/a/c.rs`, which tokio writes 23 times — so the call goes unresolved
+  // and keeps the qualifier as the source wrote it.
+  if (consumed < inlineMods) return { qualifier, rootedInInlineMod: true };
+
+  const rest = segments.slice(consumed);
+  // What is left may still climb above the file, and then it is a
+  // file-relative `super::` path, which is exactly how it now reads.
+  return { qualifier: rest.length === 0 ? "self" : rest.join("::"), rootedInInlineMod: false };
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function collectRustUseBindings(decl: any, bindings: RustUseBinding[]): void {
+  const join = (prefix: string, rest: string): string => (prefix ? `${prefix}::${rest}` : rest);
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const walk = (node: any, prefix: string): void => {
+    switch (node.kind()) {
+      case "use_as_clause": {
+        const pathNode = node.field("path");
+        const aliasNode = node.field("alias");
+        if (!pathNode || !aliasNode) return;
+        // `use crate::a::{self as A};` names `crate::a`, not `crate::a::self`:
+        // inside a list, `self` is the module the list hangs off. Recorded
+        // literally, `A::run()` matched no module and went unresolved. cargo
+        // 1.98 compiles that fixture with `A::run()` returning `a`'s own.
+        const target = pathNode.text();
+        bindings.push({
+          local: aliasNode.text(),
+          path: target === "self" ? (prefix || "self") : join(prefix, target),
+        });
+        return;
+      }
+      case "scoped_use_list": {
+        const listNode = node.field("list");
+        if (!listNode) return;
+        const pathNode = node.field("path");
+        const inner = pathNode ? join(prefix, pathNode.text()) : prefix;
+        // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+        for (const child of listNode.children()) walk(child as any, inner);
+        return;
+      }
+      case "use_list": {
+        // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+        for (const child of node.children()) walk(child as any, prefix);
+        return;
+      }
+      case "identifier":
+      case "scoped_identifier": {
+        const text = node.text();
+        const local = text.split("::").pop() ?? text;
+        bindings.push({ local, path: join(prefix, text) });
+        return;
+      }
+      case "self": {
+        const last = prefix.split("::").pop();
+        if (last) bindings.push({ local: last, path: prefix });
+        return;
+      }
+      case "use_wildcard": {
+        // `use imp::*;` binds names this cannot enumerate — the module it
+        // reads from need not even be a file. It is recorded under `*` all the
+        // same, because "some name arrives at this file's top level from that
+        // module" is exactly what separates "the top level cannot reach that
+        // symbol" from "it might, and nothing here can tell". tokio's
+        // `runtime/scheduler/multi_thread/counters.rs` re-exports an inline
+        // `mod` this way, and 34 calls depend on it.
+        const text = node.text();
+        const from = text.endsWith("::*") ? text.slice(0, -3) : "";
+        bindings.push({ local: "*", path: join(prefix, from) });
+        return;
+      }
+      default:
+        // `use`, `;`, `{`, `}`, `,`, a visibility modifier.
+        return;
+    }
+  };
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  for (const child of decl.children()) walk(child as any, "");
+}
+
 function extractFromRust(
   source: string,
   file: string,
@@ -1745,6 +2035,12 @@ function extractFromRust(
   // the only key that orders two declarations sharing a line. See the sort at
   // the end of this function.
   const declared: Array<{ sym: SymbolNode; offset: number }> = [];
+  const bindings: RustUseBinding[] = [];
+  // The declarations that sit inside an inline `mod`. Collected here because
+  // this is the only place the nesting is still visible: by the time
+  // resolution has the symbols, an inline module has left no trace on them.
+  // Ids, not nodes, because that is what a candidate list holds.
+  const inlineModSymbolIds: Array<[string, string]> = [];
 
   for (const fn of safeFindAll(root, "function_item")) {
     const nameNode = safeFind(fn, "identifier");
@@ -1758,6 +2054,8 @@ function extractFromRust(
       name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
     };
     declared.push({ sym, offset: r.start.index });
+    const fnInlineMod = rustInlineModPath(fn);
+    if (fnInlineMod) inlineModSymbolIds.push([sym.id, fnInlineMod]);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -1778,10 +2076,16 @@ function extractFromRust(
   // `function_item`, and an associated `type` or `const` through this table —
   // under a bare name, without the implementing type, the way a method's name
   // is already bare. Two impls of one trait therefore yield two symbols of the
-  // same associated name; the trait's own `type Item;` yields none, being an
-  // `associated_type` rather than a `type_item`. Both are stated in the pull
-  // request as limits rather than fixed here: qualifying a name is a change to
-  // how every language in this file names a member.
+  // same associated name: reported as a limit rather than fixed, because
+  // qualifying a name is a change to how every language in this file names a
+  // member.
+  //
+  // A declaration without a body is still a declaration. `function_signature_item`
+  // covers both places Rust puts one — a method declared in a trait, and a `fn`
+  // inside an `extern` block — and `associated_type` is the trait's own
+  // `type Item;`, which is a different node from the `type_item` an impl writes.
+  // Reading only the definitions meant a reader who found a trait could not find
+  // anything the trait declares.
   //
   // A `use` is genuinely not an item: what it names is declared elsewhere, and
   // the file graph already carries that edge.
@@ -1804,13 +2108,26 @@ function extractFromRust(
     ["enum_item", "enum"],
     ["trait_item", "trait"],
     ["type_item", "type"],
+    ["associated_type", "type"],
     ["const_item", "variable"],
     ["static_item", "variable"],
+    ["function_signature_item", "function"],
   ]);
   // One pass, not one per kind: `findAll` walks the whole tree each time it is
-  // called, so seven calls read the file seven times. Measured on ripgrep's
-  // `crates/core/flags/defs.rs`, seven passes cost +51% over `main` on this
-  // function and one costs +18%.
+  // called, so one call per kind reads the file once per kind. Measured on
+  // ripgrep's `crates/core/flags/defs.rs`, seven separate passes cost +51% over
+  // reading no items at all, where one pass costs +18%.
+  // Only the `use` declarations at the top of the file, which are the ones
+  // whose names are in scope for the whole file. A `use` written inside a `fn`
+  // or a `mod x { }` binds a name **there**, and treating it as the file's
+  // would let it point a call in a different scope at a different type — a
+  // wrong answer stated as `unique`, which is worse than no answer. Reading
+  // `root.children()` costs nothing: it does not descend.
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  for (const child of root.children() as any[]) {
+    if (child.kind() === "use_declaration") collectRustUseBindings(child, bindings);
+  }
+
   for (const item of safeFindAllAny(root, [...RUST_ITEM_KINDS.keys()])) {
     const symbolKind = RUST_ITEM_KINDS.get(item.kind());
     if (!symbolKind) continue;
@@ -1819,9 +2136,10 @@ function extractFromRust(
     const name = nameNode.text();
     const r = item.range();
     const startLine = r.start.line + 1;
+    const id = makeId(file, name, startLine);
     declared.push({
       sym: {
-        id: makeId(file, name, startLine),
+        id,
         name,
         qualifiedName: name,
         kind: symbolKind,
@@ -1832,18 +2150,25 @@ function extractFromRust(
       },
       offset: r.start.index,
     });
+    const itemInlineMod = rustInlineModPath(item);
+    if (itemInlineMod) inlineModSymbolIds.push([id, itemInlineMod]);
   }
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
   for (const node of safeFindAll(root, "call_expression")) {
-    const calleeName = extractCalleeNameJs(node.text());
-    if (!calleeName) continue;
+    const callee = extractCalleeInfoRust(node.field("function"));
+    if (!callee) continue;
     const r = node.range();
     const callLine = r.start.line + 1;
+    const qualifier = callee.qualifier
+      ? rustQualifierFromFile(node, callee.qualifier)
+      : undefined;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName,
+      calleeName: callee.name,
       kind: "call",
+      calleeQualifier: qualifier?.qualifier,
+      qualifierRootedInInlineMod: qualifier?.rootedInInlineMod ? true : undefined,
       callSite: { file, line: callLine },
     });
   }
@@ -1878,7 +2203,7 @@ function extractFromRust(
   declared.sort((a, b) => a.offset - b.offset);
   const symbols: SymbolNode[] = [moduleSym, ...declared.map((d) => d.sym)];
 
-  return { symbols, rawCalls };
+  return { symbols, rawCalls, bindings, inlineModSymbolIds };
 }
 
 // ── JVM (Java / Kotlin / Scala) ──────────────────────────────────────────
@@ -2468,6 +2793,7 @@ export function rawCallsToUnresolvedEdges(
     sourceModule: c.sourceModule,
     importedName: c.importedName,
     localAlias: c.localAlias,
+    calleeQualifier: c.calleeQualifier,
     callSite: c.callSite,
   }));
 }
