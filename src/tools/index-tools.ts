@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
-import { mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
+import { collectionName, projectIdFromPath } from "../config.js";
+import { getWatcherMode, mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
 import { awaitGraphBuild, isGraphBuildInProgress } from "../services/code-graph.js";
 import type { InfraProgressCallback } from "../services/docker.js";
 import { ensureQdrantReady, isDockerAvailable } from "../services/docker.js";
-import { getEmbeddingConfig } from "../services/embedding-config.js";
-import { getEmbeddingProvider } from "../services/embedding-provider.js";
+import { ensureEffectiveEmbeddingReady } from "../services/index-profile.js";
 import { getIndexingProgress, indexProject, isIndexingInProgress, removeProjectIndex, requestCancellation, setIndexingProgress, updateProjectIndex } from "../services/indexer.js";
 import { isProjectLocked, terminateLockHolder } from "../services/lock.js";
 import { logger } from "../services/logger.js";
-import { getWatchedProjects, isWatching, startWatching, stopWatching } from "../services/watcher.js";
+import { loadEffectiveIndexProfileForCollection } from "../services/qdrant.js";
+import { getWatchedProjects, isWatching, startWatching, startWatchingAutomatically, stopWatching } from "../services/watcher.js";
 
 const DOCKER_NOT_AVAILABLE_MESSAGE = [
   "❌ Docker is not available.",
@@ -27,19 +28,23 @@ const DOCKER_NOT_AVAILABLE_MESSAGE = [
   "Run codebase_health for a full infrastructure diagnostic.",
 ].join("\n");
 
-async function ensureInfrastructure(onProgress?: InfraProgressCallback): Promise<string[]> {
+async function ensureInfrastructure(
+  projectPath: string,
+  onProgress?: InfraProgressCallback,
+): Promise<string[]> {
   const messages: string[] = [];
-  const config = getEmbeddingConfig();
 
   const docker = await ensureQdrantReady(onProgress);
   if (docker.pulled) messages.push("Pulled Qdrant Docker image.");
   if (docker.started) messages.push("Started Qdrant container.");
 
-  const provider = await getEmbeddingProvider(onProgress);
-  const readiness = await provider.ensureReady();
+  const resolvedPath = path.resolve(projectPath);
+  const collection = collectionName(projectIdFromPath(resolvedPath));
+  const profile = await loadEffectiveIndexProfileForCollection(collection);
+  const readiness = await ensureEffectiveEmbeddingReady(profile, onProgress);
   if (readiness.imagePulled) messages.push("Pulled Ollama Docker image.");
   if (readiness.containerStarted) messages.push("Started Ollama container.");
-  if (readiness.modelPulled) messages.push(`Pulled ${config.embeddingModel} model.`);
+  if (readiness.modelPulled) messages.push(`Pulled ${profile.embedding.model} model.`);
 
   return messages;
 }
@@ -108,7 +113,7 @@ export async function handleIndexTool(
       // Infrastructure setup is synchronous — we need Docker/Ollama running before indexing
       let infraMessages: string[];
       try {
-        infraMessages = await ensureInfrastructure(infraProgress);
+        infraMessages = await ensureInfrastructure(resolved, infraProgress);
       } catch (error) {
         // Clear the progress on infra failure
         setIndexingProgress(resolved, null);
@@ -137,7 +142,7 @@ export async function handleIndexTool(
 
           // Auto-start watcher only if indexing completed (not cancelled)
           if (!result.cancelled && !isWatching(resolved)) {
-            const started = await startWatching(resolved);
+            const started = await startWatchingAutomatically(resolved);
             if (started) {
               logger.info("Auto-started file watcher", { projectPath: resolved });
             }
@@ -172,7 +177,7 @@ export async function handleIndexTool(
         return DOCKER_NOT_AVAILABLE_MESSAGE;
       }
 
-      const infraMessages = await ensureInfrastructure(onProgress);
+      const infraMessages = await ensureInfrastructure(resolved, onProgress);
       const updateExtraExts = mergeExtraExtensions(args.extraExtensions as string | undefined);
       const result = await updateProjectIndex(projectPath, onProgress, updateExtraExts.size > 0 ? updateExtraExts : undefined);
       const lines = [
@@ -189,7 +194,7 @@ export async function handleIndexTool(
 
       // Auto-start watcher after successful update (not cancelled)
       if (!result.cancelled && !isWatching(resolved)) {
-        const started = await startWatching(resolved);
+        const started = await startWatchingAutomatically(resolved);
         if (started) {
           logger.info("Auto-started file watcher after update", { projectPath: resolved });
         }
@@ -339,9 +344,17 @@ export async function handleIndexTool(
 
     case "codebase_watch": {
       const action = args.action as string;
+      const watcherMode = getWatcherMode();
 
       if (action === "start") {
-        await ensureInfrastructure();
+        if (watcherMode === "off") {
+          return [
+            "File watcher disabled by SOCRATICODE_WATCHER=off.",
+            "Set SOCRATICODE_WATCHER=manual or auto and restart the MCP server before starting it.",
+          ].join("\n");
+        }
+
+        await ensureInfrastructure(projectPath);
 
         // Catch any changes made while the watcher was not running before starting it.
         const resolved = path.resolve(projectPath);
@@ -384,14 +397,36 @@ export async function handleIndexTool(
       const resolved = path.resolve(projectPath);
       // Check if the current project is watched by another process (cross-process lock)
       const watchedByOtherProcess = !watched.includes(resolved) && await isProjectLocked(resolved, "watch");
+
+      if (watcherMode === "off") {
+        const lines = ["File watcher: disabled (SOCRATICODE_WATCHER=off)"];
+        if (watched.includes(resolved)) {
+          lines.push(
+            "Warning: this process still has an active watcher. Restart the MCP server to apply the changed environment setting.",
+          );
+        } else if (watchedByOtherProcess) {
+          lines.push(
+            "Warning: another MCP process is still watching this project. Set SOCRATICODE_WATCHER=off for every process that uses this checkout.",
+          );
+        }
+        return lines.join("\n");
+      }
+
       if (watched.length === 0 && !watchedByOtherProcess) {
+        if (watcherMode === "manual") {
+          return [
+            "No projects are currently being watched.",
+            "Automatic watcher startup is disabled by SOCRATICODE_WATCHER=manual; use codebase_watch with action=start to start it explicitly.",
+          ].join("\n");
+        }
         return "No projects are currently being watched.";
       }
       const statusItems = watched.map((p) => `  - ${p}`);
       if (watchedByOtherProcess) {
         statusItems.push(`  - ${resolved} (watched by another process)`);
       }
-      return `Currently watching:\n${statusItems.join("\n")}`;
+      const modeLine = watcherMode === "manual" ? "\nWatcher mode: manual (started explicitly)" : "";
+      return `Currently watching:\n${statusItems.join("\n")}${modeLine}`;
     }
 
     default:

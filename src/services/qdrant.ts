@@ -6,6 +6,15 @@ import { QDRANT_API_KEY, QDRANT_COLLECTION_PREFIX, QDRANT_HOST, QDRANT_PORT, QDR
 import type { ArtifactIndexState, CodeGraph, FileChunk, SearchResult } from "../types.js";
 import { getEmbeddingConfig } from "./embedding-config.js";
 import { generateEmbeddings, generateQueryEmbedding, prepareDocumentText } from "./embeddings.js";
+import {
+  documentTextProfile,
+  type EffectiveIndexProfile,
+  ensureEffectiveEmbeddingReady,
+  parseEffectiveIndexProfile,
+  queryProfileKey,
+  resolveEffectiveIndexProfile,
+  withEffectiveEmbedding,
+} from "./index-profile.js";
 import { logger } from "./logger.js";
 
 const MAX_RETRIES = 3;
@@ -112,58 +121,85 @@ export function getClient(): QdrantClient {
   return client;
 }
 
-/** Create a collection if it doesn't exist */
-export async function ensureCollection(name: string): Promise<void> {
+/** In-flight code-collection initialization, keyed by collection name. */
+const collectionEnsureInFlight = new Map<string, Promise<void>>();
+
+/** Create a collection if needed and ensure its required payload indexes. */
+async function ensureCollectionOnce(name: string): Promise<void> {
   const qdrant = getClient();
   const collections = await qdrant.getCollections();
   const exists = collections.collections.some((c) => c.name === name);
 
   if (!exists) {
     const { embeddingDimensions } = getEmbeddingConfig();
-    await qdrant.createCollection(name, {
-      vectors: {
-        dense: {
-          size: embeddingDimensions,
-          distance: "Cosine",
+    try {
+      await qdrant.createCollection(name, {
+        vectors: {
+          dense: {
+            size: embeddingDimensions,
+            distance: "Cosine",
+          },
         },
-      },
-      sparse_vectors: {
-        bm25: {
-          modifier: "idf",
+        sparse_vectors: {
+          bm25: {
+            modifier: "idf",
+          },
         },
-      },
-      optimizers_config: {
-        default_segment_number: 2,
-      },
-      on_disk_payload: true,
-    });
+        optimizers_config: {
+          default_segment_number: 2,
+        },
+        on_disk_payload: true,
+      });
+    } catch (err) {
+      // Another process may create the same collection after our membership
+      // check. That is the desired end state; every other failure must surface.
+      if (!isAlreadyExistsError(err)) throw err;
+    }
+  }
 
-    // Create payload indexes for faster filtering
-    await qdrant.createPayloadIndex(name, {
-      field_name: "filePath",
-      field_schema: "keyword",
-    });
-    await qdrant.createPayloadIndex(name, {
-      field_name: "relativePath",
-      field_schema: "keyword",
-    });
-    await qdrant.createPayloadIndex(name, {
-      field_name: "language",
-      field_schema: "keyword",
-    });
-    await qdrant.createPayloadIndex(name, {
-      field_name: "contentHash",
-      field_schema: "keyword",
-    });
+  // A previous or concurrent attempt may have created the collection without
+  // completing all indexes. Ensure every required index on every initialization.
+  await Promise.all([
+    createPayloadIndexIfMissing(name, "filePath"),
+    createPayloadIndexIfMissing(name, "relativePath"),
+    createPayloadIndexIfMissing(name, "language"),
+    createPayloadIndexIfMissing(name, "contentHash"),
+  ]);
+}
+
+/**
+ * Ensure a code collection is ready, sharing one attempt between concurrent
+ * callers in this process. Failed attempts are removed so a later call retries.
+ */
+export async function ensureCollection(name: string): Promise<void> {
+  const current = collectionEnsureInFlight.get(name);
+  if (current) return current;
+
+  const attempt = ensureCollectionOnce(name);
+  collectionEnsureInFlight.set(name, attempt);
+  try {
+    await attempt;
+  } finally {
+    if (collectionEnsureInFlight.get(name) === attempt) {
+      collectionEnsureInFlight.delete(name);
+    }
   }
 }
 
 /** True when an error means "someone else already created it" — safe to ignore. */
-function isAlreadyExistsError(err: unknown): boolean {
+export function isAlreadyExistsError(err: unknown): boolean {
   const status =
     (err as { status?: number })?.status ?? (err as { statusCode?: number })?.statusCode;
   const message = err instanceof Error ? err.message : String(err);
   return status === 409 || /already exists/i.test(message);
+}
+
+/** True when a Qdrant resource is absent rather than temporarily unavailable. */
+function isNotFoundError(err: unknown): boolean {
+  const status =
+    (err as { status?: number })?.status ?? (err as { statusCode?: number })?.statusCode;
+  const message = err instanceof Error ? err.message : String(err);
+  return status === 404 || /not found|doesn't exist/i.test(message);
 }
 
 /**
@@ -235,27 +271,28 @@ export async function listCodebaseCollections(): Promise<string[]> {
         n.startsWith(`${p}context_`),
     );
 
-  // Also check metadata for graph and context entries (stored as metadata points, not real collections)
-  try {
-    await ensureMetadataCollection();
-    const metaPoints = await qdrant.scroll(METADATA_COLLECTION, {
-      limit: 100,
-      with_payload: true,
-    });
-    for (const point of metaPoints.points) {
-      const collName = point.payload?.collectionName as string | undefined;
-      if (
-        (collName?.startsWith(`${p}codegraph_`) || collName?.startsWith(`${p}context_`)) &&
-        !result.includes(collName)
-      ) {
-        result.push(collName);
+  // Also check metadata for graph and context entries (stored as metadata points, not real collections).
+  // Listing is read-only: an absent metadata collection means there are no metadata-only entries yet.
+  if (collections.collections.some((collection) => collection.name === METADATA_COLLECTION)) {
+    try {
+      const metaPoints = await qdrant.scroll(METADATA_COLLECTION, {
+        limit: 100,
+        with_payload: true,
+      });
+      for (const point of metaPoints.points) {
+        const collName = point.payload?.collectionName as string | undefined;
+        if (
+          (collName?.startsWith(`${p}codegraph_`) || collName?.startsWith(`${p}context_`)) &&
+          !result.includes(collName)
+        ) {
+          result.push(collName);
+        }
       }
+    } catch (err) {
+      logger.info("listCodebaseCollections: metadata scroll failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
-  } catch (err) {
-    // Metadata collection may not exist yet (expected before first index)
-    logger.info("listCodebaseCollections: metadata scroll failed (expected if no projects indexed yet)", {
-      error: err instanceof Error ? err.message : String(err),
-    });
   }
 
   return result;
@@ -266,12 +303,15 @@ export async function upsertChunks(
   collectionName: string,
   chunks: FileChunk[],
   contentHash: string,
+  profile: EffectiveIndexProfile,
 ): Promise<void> {
   if (chunks.length === 0) return;
 
   const qdrant = getClient();
-  const texts = chunks.map((c) => prepareDocumentText(c.content, c.relativePath));
-  const embeddings = await generateEmbeddings(texts);
+  const texts = chunks.map((c) =>
+    prepareDocumentText(c.content, c.relativePath, documentTextProfile(profile)),
+  );
+  const embeddings = await withEffectiveEmbedding(profile, () => generateEmbeddings(texts));
 
   const points = chunks.map((chunk, i) => ({
     id: chunk.id,
@@ -402,8 +442,46 @@ export async function searchChunks(
   fileFilter?: string,
   languageFilter?: string,
 ): Promise<SearchResult[]> {
-  const queryVector = await generateQueryEmbedding(query);
+  const profile = await loadEffectiveIndexProfileForCollection(collectionName);
+  const queryVector = await queryVectorForProfile(query, profile);
   return searchChunksWithVector(collectionName, query, queryVector, limit, fileFilter, languageFilter);
+}
+
+function collectionProfileKind(collectionName: string): "code" | "context" {
+  return collectionName.startsWith(`${QDRANT_COLLECTION_PREFIX}context_`)
+    ? "context"
+    : "code";
+}
+
+export async function loadEffectiveIndexProfileForCollection(
+  collectionName: string,
+): Promise<EffectiveIndexProfile> {
+  const info = await getCollectionInfo(collectionName);
+  const kind = collectionProfileKind(collectionName);
+  const stored = info === null
+    ? null
+    : kind === "context"
+      ? await loadContextEffectiveProfile(collectionName)
+      : await loadProjectEffectiveProfile(collectionName);
+  const profile = resolveEffectiveIndexProfile(
+    kind,
+    stored,
+    (info?.pointsCount ?? 0) > 0,
+    info?.denseVectorSize,
+  );
+  return profile;
+}
+
+function queryVectorForProfile(
+  query: string,
+  profile: EffectiveIndexProfile,
+): Promise<number[]> {
+  return withEffectiveEmbedding(profile, async () => {
+    if (profile.embedding.provider === "ollama") {
+      await ensureEffectiveEmbeddingReady(profile);
+    }
+    return generateQueryEmbedding(query, profile.queryPrefix);
+  });
 }
 
 /** Internal: hybrid search using a pre-computed dense embedding vector.
@@ -626,8 +704,11 @@ export async function searchMultipleCollections(
     return results.map((r) => ({ ...r, project: collections[0].label }));
   }
 
-  // Compute the dense embedding once for all collections
-  const queryVector = await generateQueryEmbedding(query);
+  // Reuse a query vector only where the persisted query-side identity is
+  // compatible. Unverified legacy profiles receive collection-specific keys.
+  // Promises are cached before they are awaited so concurrent collections with
+  // the same verified profile share exactly one embedding request.
+  const queryVectors = new Map<string, Promise<number[]>>();
 
   // Query all collections in parallel, requesting extra candidates for RRF re-ranking
   const perCollectionLimit = Math.max(limit * 2, 20);
@@ -636,6 +717,15 @@ export async function searchMultipleCollections(
   const allResults = await Promise.all(
     collections.map(async ({ name, label }) => {
       try {
+        const profile = await loadEffectiveIndexProfileForCollection(name);
+        const key = queryProfileKey(profile, name);
+        let queryVectorPromise = queryVectors.get(key);
+        if (!queryVectorPromise) {
+          queryVectorPromise = queryVectorForProfile(query, profile);
+          queryVectors.set(key, queryVectorPromise);
+        }
+        const queryVector = await queryVectorPromise;
+
         // includeDenseScore: results from different collections are about to be
         // ordered against each other, which their per-collection RRF scores
         // cannot support.
@@ -665,7 +755,8 @@ export async function searchChunksWithFilter(
   filters: Array<{ key: string; value: string }>,
 ): Promise<SearchResult[]> {
   const qdrant = getClient();
-  const queryVector = await generateQueryEmbedding(query);
+  const profile = await loadEffectiveIndexProfileForCollection(collectionName);
+  const queryVector = await queryVectorForProfile(query, profile);
 
   const filter = filters.length > 0
     ? { must: filters.map((f) => ({ key: f.key, match: { value: f.value } })) }
@@ -707,23 +798,47 @@ export async function searchChunksWithFilter(
  * Returns the collection info if it exists, null if the collection does not exist,
  * or throws an error if the request fails for any other reason (network, timeout, etc.).
  * This distinction is critical: callers must NOT treat transient errors as "collection missing". */
-export async function getCollectionInfo(name: string): Promise<{
+export interface CollectionInfo {
   pointsCount: number;
   status: string;
-} | null> {
+  /** Stored dense-vector width, when Qdrant exposes a supported vector config. */
+  denseVectorSize?: number;
+}
+
+function denseVectorSizeFromInfo(info: unknown): number | undefined {
+  const vectors = (info as {
+    config?: { params?: { vectors?: unknown } };
+  }).config?.params?.vectors;
+  if (typeof vectors !== "object" || vectors === null || Array.isArray(vectors)) {
+    return undefined;
+  }
+  const vectorConfig = vectors as Record<string, unknown>;
+  const dense = vectorConfig.dense;
+  const size =
+    typeof dense === "object" && dense !== null && !Array.isArray(dense)
+      ? (dense as Record<string, unknown>).size
+      : vectorConfig.size;
+  return Number.isInteger(size) && (size as number) > 0
+    ? size as number
+    : undefined;
+}
+
+export async function getCollectionInfo(name: string): Promise<CollectionInfo | null> {
   const qdrant = getClient();
   try {
     const info = await qdrant.getCollection(name);
+    const denseVectorSize = denseVectorSizeFromInfo(info);
     return {
       pointsCount: info.points_count ?? 0,
       status: info.status,
+      ...(denseVectorSize !== undefined ? { denseVectorSize } : {}),
     };
   } catch (err: unknown) {
     // Only return null for "not found" — propagate all other errors
     const message = err instanceof Error ? err.message : String(err);
     const status =
       (err as { status?: number })?.status ?? (err as { statusCode?: number })?.statusCode;
-    if (status === 404 || message.includes("Not found") || message.includes("doesn't exist") || message.includes("not found")) {
+    if (isNotFoundError(err)) {
       return null;
     }
     logger.warn("getCollectionInfo failed with unexpected error (propagating)", { collection: name, error: message, status });
@@ -823,8 +938,47 @@ function metadataPointId(collName: string): string {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
 }
 
+/**
+ * Retrieve one metadata payload without provisioning or modifying Qdrant.
+ * A missing metadata collection or point is normal before the first metadata write.
+ */
+async function loadMetadataPayloadReadOnly(
+  collName: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const points = await getClient().retrieve(METADATA_COLLECTION, {
+      ids: [metadataPointId(collName)],
+      with_payload: true,
+    });
+    if (points.length === 0) return null;
+    return (points[0].payload as Record<string, unknown> | null | undefined) ?? null;
+  } catch (err) {
+    if (isNotFoundError(err)) return null;
+    throw err;
+  }
+}
+
 /** Indexing status persisted in Qdrant metadata */
 export type IndexingStatus = "in-progress" | "completed";
+
+export interface ProjectMetadata {
+  projectPath: string;
+  lastIndexedAt: string;
+  filesTotal: number;
+  filesIndexed: number;
+  indexingStatus: IndexingStatus;
+  effectiveProfile: EffectiveIndexProfile | null;
+}
+
+function profileFromPayload(
+  payload: Record<string, unknown> | null | undefined,
+  kind: "code" | "context",
+): EffectiveIndexProfile | null {
+  const serialized = payload?.effectiveIndexProfile;
+  if (serialized === undefined || serialized === null) return null;
+  const parsed = typeof serialized === "string" ? JSON.parse(serialized) : serialized;
+  return parseEffectiveIndexProfile(parsed, kind);
+}
 
 /** Save project metadata and file hashes to Qdrant */
 export async function saveProjectMetadata(
@@ -834,6 +988,7 @@ export async function saveProjectMetadata(
   filesIndexed: number,
   fileHashes: Map<string, string>,
   indexingStatus: IndexingStatus,
+  effectiveProfile: EffectiveIndexProfile,
 ): Promise<void> {
   await ensureMetadataCollection();
   const qdrant = getClient();
@@ -857,12 +1012,24 @@ export async function saveProjectMetadata(
           filesIndexed,
           fileHashes: JSON.stringify(hashObj),
           indexingStatus,
+          effectiveIndexProfile: JSON.stringify(effectiveProfile),
         },
       },
     ],
   });
 
   logger.info("Saved project metadata", { collName, projectPath, filesTotal, filesIndexed, indexingStatus });
+}
+
+/** Load only the stored code-index profile. Missing profile means legacy metadata. */
+export async function loadProjectEffectiveProfile(
+  collName: string,
+): Promise<EffectiveIndexProfile | null> {
+  try {
+    return profileFromPayload(await loadMetadataPayloadReadOnly(collName), "code");
+  } catch (err) {
+    throw wrapQdrantError("loadProjectEffectiveProfile", { collName }, err);
+  }
 }
 
 /** Load file hashes for a project from Qdrant.
@@ -898,32 +1065,20 @@ export async function loadProjectHashes(collName: string): Promise<Map<string, s
 
 /** Get project metadata (for list display).
  * Returns null if metadata doesn't exist or on any error (logged as warning). */
-export async function getProjectMetadata(collName: string): Promise<{
-  projectPath: string;
-  lastIndexedAt: string;
-  filesTotal: number;
-  filesIndexed: number;
-  indexingStatus: IndexingStatus;
-} | null> {
+export async function getProjectMetadata(collName: string): Promise<ProjectMetadata | null> {
   try {
-    await ensureMetadataCollection();
-    const qdrant = getClient();
-    const id = metadataPointId(collName);
-
-    const points = await qdrant.retrieve(METADATA_COLLECTION, {
-      ids: [id],
-      with_payload: true,
-    });
-
-    if (points.length === 0) return null;
-
-    const payload = points[0].payload;
+    const payload = await loadMetadataPayloadReadOnly(collName);
+    if (payload === null) return null;
     return {
       projectPath: payload?.projectPath as string,
       lastIndexedAt: payload?.lastIndexedAt as string,
       filesTotal: (payload?.filesTotal as number) ?? (payload?.filesIndexed as number) ?? 0,
       filesIndexed: (payload?.filesIndexed as number) ?? 0,
       indexingStatus: (payload?.indexingStatus as IndexingStatus) ?? "completed",
+      effectiveProfile: profileFromPayload(
+        payload as Record<string, unknown> | undefined,
+        "code",
+      ),
     };
   } catch (err) {
     logger.warn("getProjectMetadata failed (returning null)", {
@@ -1004,18 +1159,8 @@ export async function saveGraphData(
  * Returns null if no graph exists or on any error (logged as warning). */
 export async function loadGraphData(graphCollName: string): Promise<CodeGraph | null> {
   try {
-    await ensureMetadataCollection();
-    const qdrant = getClient();
-    const id = metadataPointId(graphCollName);
-
-    const points = await qdrant.retrieve(METADATA_COLLECTION, {
-      ids: [id],
-      with_payload: true,
-    });
-
-    if (points.length === 0) return null;
-
-    const payload = points[0].payload;
+    const payload = await loadMetadataPayloadReadOnly(graphCollName);
+    if (payload === null) return null;
     if (!payload?.graphData) return null;
 
     return JSON.parse(payload.graphData as string) as CodeGraph;
@@ -1042,18 +1187,8 @@ export async function getGraphMetadata(graphCollName: string): Promise<{
   builtByVersion?: string;
 } | null> {
   try {
-    await ensureMetadataCollection();
-    const qdrant = getClient();
-    const id = metadataPointId(graphCollName);
-
-    const points = await qdrant.retrieve(METADATA_COLLECTION, {
-      ids: [id],
-      with_payload: true,
-    });
-
-    if (points.length === 0) return null;
-
-    const payload = points[0].payload;
+    const payload = await loadMetadataPayloadReadOnly(graphCollName);
+    if (payload === null) return null;
     return {
       projectPath: payload?.projectPath as string,
       lastBuiltAt: payload?.lastBuiltAt as string,
@@ -1095,6 +1230,7 @@ export async function saveContextMetadata(
   contextCollName: string,
   projectPath: string,
   artifacts: ArtifactIndexState[],
+  effectiveProfile: EffectiveIndexProfile,
 ): Promise<void> {
   await ensureMetadataCollection();
   const qdrant = getClient();
@@ -1111,6 +1247,7 @@ export async function saveContextMetadata(
           lastIndexedAt: new Date().toISOString(),
           artifactCount: artifacts.length,
           artifacts: JSON.stringify(artifacts),
+          effectiveIndexProfile: JSON.stringify(effectiveProfile),
         },
       },
     ],
@@ -1119,25 +1256,45 @@ export async function saveContextMetadata(
   logger.info("Saved context artifact metadata", { contextCollName, projectPath, artifactCount: artifacts.length });
 }
 
+export interface ContextIndexMetadata {
+  artifacts: ArtifactIndexState[];
+  effectiveProfile: EffectiveIndexProfile | null;
+}
+
+/**
+ * Load context states and profile for mutation paths. Missing metadata returns
+ * null; transport, JSON, and profile validation failures propagate.
+ */
+export async function loadContextIndexMetadata(
+  contextCollName: string,
+): Promise<ContextIndexMetadata | null> {
+  try {
+    const payload = await loadMetadataPayloadReadOnly(contextCollName);
+    if (payload === null) return null;
+    const artifacts = payload?.artifacts
+      ? JSON.parse(payload.artifacts as string) as ArtifactIndexState[]
+      : [];
+    return {
+      artifacts,
+      effectiveProfile: profileFromPayload(payload, "context"),
+    };
+  } catch (err) {
+    throw wrapQdrantError("loadContextIndexMetadata", { contextCollName }, err);
+  }
+}
+
+/** Load only the stored context-index profile. Missing profile means legacy metadata. */
+export async function loadContextEffectiveProfile(
+  contextCollName: string,
+): Promise<EffectiveIndexProfile | null> {
+  return (await loadContextIndexMetadata(contextCollName))?.effectiveProfile ?? null;
+}
+
 /** Load context artifact metadata from Qdrant.
  * Returns null if no metadata exists or on any error (logged as warning). */
 export async function loadContextMetadata(contextCollName: string): Promise<ArtifactIndexState[] | null> {
   try {
-    await ensureMetadataCollection();
-    const qdrant = getClient();
-    const id = metadataPointId(contextCollName);
-
-    const points = await qdrant.retrieve(METADATA_COLLECTION, {
-      ids: [id],
-      with_payload: true,
-    });
-
-    if (points.length === 0) return null;
-
-    const payload = points[0].payload;
-    if (!payload?.artifacts) return null;
-
-    return JSON.parse(payload.artifacts as string) as ArtifactIndexState[];
+    return (await loadContextIndexMetadata(contextCollName))?.artifacts ?? null;
   } catch (err) {
     logger.warn("loadContextMetadata failed (returning null)", {
       contextCollName,
@@ -1153,24 +1310,19 @@ export async function getContextMetadata(contextCollName: string): Promise<{
   projectPath: string;
   lastIndexedAt: string;
   artifactCount: number;
+  effectiveProfile: EffectiveIndexProfile | null;
 } | null> {
   try {
-    await ensureMetadataCollection();
-    const qdrant = getClient();
-    const id = metadataPointId(contextCollName);
-
-    const points = await qdrant.retrieve(METADATA_COLLECTION, {
-      ids: [id],
-      with_payload: true,
-    });
-
-    if (points.length === 0) return null;
-
-    const payload = points[0].payload;
+    const payload = await loadMetadataPayloadReadOnly(contextCollName);
+    if (payload === null) return null;
     return {
       projectPath: payload?.projectPath as string,
       lastIndexedAt: payload?.lastIndexedAt as string,
       artifactCount: (payload?.artifactCount as number) ?? 0,
+      effectiveProfile: profileFromPayload(
+        payload as Record<string, unknown> | undefined,
+        "context",
+      ),
     };
   } catch (err) {
     logger.warn("getContextMetadata failed (returning null)", {

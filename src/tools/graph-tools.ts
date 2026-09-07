@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
 import { projectIdFromPath } from "../config.js";
-import { mergeExtraExtensions, SOCRATICODE_VERSION } from "../constants.js";
-import { awaitGraphBuild, describeGraphBuilder, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getDynamicLanguageStatus, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
+import { getWatcherMode, mergeExtraExtensions, SOCRATICODE_VERSION } from "../constants.js";
+import { awaitGraphBuild, describeGraphBuilder, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getAstGrepLang, getDynamicLanguageStatus, getExistingGraph, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
 import { detectEntryPoints } from "../services/graph-entrypoints.js";
 import {
   type FlowNode,
@@ -16,7 +16,14 @@ import {
 import { openInBrowser, writeInteractiveGraphFile } from "../services/graph-visualize-browser.js";
 import { buildInteractiveGraphHtml } from "../services/graph-visualize-html.js";
 import { logger } from "../services/logger.js";
-import { getSymbolGraphCache } from "../services/symbol-graph-cache.js";
+import {
+  dropSymbolGraphCacheGeneration,
+  getSymbolGraphCache,
+} from "../services/symbol-graph-cache.js";
+import {
+  StorageReadError,
+  SymbolGraphGenerationChangedError,
+} from "../services/symbol-graph-store.js";
 import { ensureWatcherStarted } from "../services/watcher.js";
 
 /**
@@ -32,21 +39,77 @@ const SYMBOL_GRAPH_TOOLS = new Set([
   "codebase_symbols",
 ]);
 
+class ExplicitGraphBuildRequiredError extends Error {}
+
+/**
+ * Default mode keeps the historical lazy-build behaviour. Snapshot modes may
+ * read a cached or persisted graph, but must not create one as a side effect of
+ * a query.
+ */
+async function getGraphForRead(projectPath: string) {
+  const watcherMode = getWatcherMode();
+  if (watcherMode === "auto") return getOrBuildGraph(projectPath);
+
+  const graph = await getExistingGraph(projectPath);
+  if (graph) return graph;
+  throw new ExplicitGraphBuildRequiredError(
+    `No code graph found for: ${projectPath}\n` +
+    `Automatic graph creation is disabled by SOCRATICODE_WATCHER=${watcherMode}. ` +
+    "Run codebase_graph_build to create it explicitly.",
+  );
+}
+
+function hasRelevantGrammarFailure(
+  failed: Array<{ name: string }>,
+  target: string,
+  file?: string,
+  symbolId?: string,
+): boolean {
+  if (failed.length === 0) return false;
+  const hintedFile = symbolId?.split("::")[0]
+    ?? file
+    ?? (looksLikeFilePath(target) ? target : undefined);
+  if (!hintedFile) return true;
+
+  const grammar = getAstGrepLang(path.extname(hintedFile).toLowerCase());
+  if (!grammar) return true;
+  return failed.some(({ name }) => name.toLowerCase() === String(grammar).toLowerCase());
+}
+
 export async function handleGraphTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<string> {
-  const result = await dispatchGraphTool(name, args);
-  if (!SYMBOL_GRAPH_TOOLS.has(name)) return result;
-  const resolved = path.resolve((args.projectPath as string) || process.cwd());
-  const symbolGraphError = getLastGraphBuildCompleted(resolved)?.symbolGraphError;
-  if (!symbolGraphError) return result;
-  return [
-    `WARNING: the last graph build could not persist the symbol graph: ${symbolGraphError}`,
-    "Results below may be stale or incomplete until a rebuild succeeds.",
-    "",
-    result,
-  ].join("\n");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await dispatchGraphTool(name, args);
+      if (!SYMBOL_GRAPH_TOOLS.has(name)) return result;
+      const resolved = path.resolve((args.projectPath as string) || process.cwd());
+      const symbolGraphError = getLastGraphBuildCompleted(resolved)?.symbolGraphError;
+      if (!symbolGraphError) return result;
+      return [
+        `WARNING: the last graph build could not persist the symbol graph: ${symbolGraphError}`,
+        "Results below may be stale or incomplete until a rebuild succeeds.",
+        "",
+        result,
+      ].join("\n");
+    } catch (err) {
+      if (err instanceof ExplicitGraphBuildRequiredError) return err.message;
+      if (
+        err instanceof SymbolGraphGenerationChangedError
+        && SYMBOL_GRAPH_TOOLS.has(name)
+        && attempt === 0
+      ) {
+        dropSymbolGraphCacheGeneration(err.projectId, err.generation);
+        continue;
+      }
+      if (err instanceof StorageReadError) {
+        return `Storage error: ${err.message}`;
+      }
+      throw err;
+    }
+  }
+  return "Storage error: symbol graph generation changed repeatedly while the query was starting";
 }
 
 async function dispatchGraphTool(
@@ -109,7 +172,7 @@ async function dispatchGraphTool(
 
     case "codebase_graph_query": {
       const filePath = args.filePath as string;
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
       const deps = getFileDependencies(graph, filePath);
 
       const lines = [`Dependencies for: ${filePath}\n`];
@@ -137,7 +200,7 @@ async function dispatchGraphTool(
     }
 
     case "codebase_graph_stats": {
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
 
       if (graph.nodes.length === 0) {
         return "No graph data available. Run codebase_graph_build first.";
@@ -180,7 +243,7 @@ async function dispatchGraphTool(
     }
 
     case "codebase_graph_circular": {
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
       const cycles = findCircularDependencies(graph);
 
       if (cycles.length === 0) {
@@ -199,7 +262,7 @@ async function dispatchGraphTool(
     }
 
     case "codebase_graph_visualize": {
-      const graph = await getOrBuildGraph(projectPath);
+      const graph = await getGraphForRead(projectPath);
 
       if (graph.nodes.length === 0) {
         return "No graph data available. Run codebase_graph_build first.";
@@ -270,16 +333,17 @@ async function dispatchGraphTool(
       // the real loader state. Idempotent and cheap after the first call.
       ensureDynamicLanguages();
       const grammarStatus = getDynamicLanguageStatus();
+      const BUILTIN_AST_LANGUAGES = [
+        "css", "html", "javascript", "tsx", "typescript",
+      ];
       const renderGrammarBlock = (): string[] => {
-        if (grammarStatus.loaded.length === 0 && grammarStatus.failed.length === 0) {
-          return [];
-        }
         const block: string[] = ["", "AST grammars:"];
+        block.push(`  Built-in (ast-grep, ${BUILTIN_AST_LANGUAGES.length}): ${BUILTIN_AST_LANGUAGES.join(", ")}`);
         if (grammarStatus.loaded.length > 0) {
-          block.push(`  Loaded (${grammarStatus.loaded.length}): ${grammarStatus.loaded.join(", ")}`);
+          block.push(`  Dynamic loaded (${grammarStatus.loaded.length}): ${grammarStatus.loaded.join(", ")}`);
         }
         if (grammarStatus.failed.length > 0) {
-          block.push(`  Failed (${grammarStatus.failed.length}):`);
+          block.push(`  Dynamic failed (${grammarStatus.failed.length}):`);
           for (const f of grammarStatus.failed) {
             block.push(`    - ${f.name}: ${f.error}`);
           }
@@ -404,22 +468,60 @@ async function dispatchGraphTool(
     }
 
     case "codebase_impact": {
-      const target = (args.target as string)?.trim();
-      if (!target) return "Missing required argument: target";
+      const target = (args.target as string | undefined)?.trim() ?? "";
+      const file = (args.file as string | undefined)?.trim();
+      const symbolId = (args.symbolId as string | undefined)?.trim();
+      if (!target && !symbolId) return "Missing required argument: target or symbolId";
       const depth = typeof args.depth === "number" ? args.depth : 3;
       const projectId = projectIdFromPath(projectPath);
       const cache = await getSymbolGraphCache(projectId);
       if (!cache) {
         return "No symbol graph found. Run codebase_graph_build (or codebase_index) first.";
       }
-      const result = await getImpactRadius(cache, target, depth);
+      ensureDynamicLanguages();
+      const grammarStatus = getDynamicLanguageStatus();
+      const isIncomplete = hasRelevantGrammarFailure(
+        grammarStatus.failed,
+        target,
+        file,
+        symbolId,
+      ) || (cache.meta.schemaVersion ? cache.meta.schemaVersion < 2 : true);
+      const result = await getImpactRadius(cache, target || (symbolId as string), depth, { file, symbolId, isIncomplete });
+
+      if (result.status === "graph_upgrade_required") {
+        return result.message ?? "The symbol graph requires an upgrade. Rebuild with codebase_graph_build.";
+      }
+      if (result.status === "storage_error") {
+        return `Storage error: ${result.message}`;
+      }
+      if (result.status === "not_found") {
+        return result.message ?? `Target '${target || symbolId}' was not found in the graph.`;
+      }
+      if (result.status === "ambiguous") {
+        const lines = [
+          `Target '${target}' is ambiguous:`,
+          result.message ?? "",
+        ];
+        if (result.candidates && result.candidates.length > 0) {
+          lines.push("");
+          lines.push("Candidates:");
+          for (const c of result.candidates) {
+            lines.push(`  - [${c.kind}] ${c.qualifiedName} in ${c.file}:${c.line} (ID: ${c.id})`);
+          }
+        }
+        return lines.join("\n").trimEnd();
+      }
+      if (result.status === "unsupported_or_incomplete") {
+        return result.message ?? `Graph analysis for '${target || symbolId}' is incomplete.`;
+      }
+
       const lines = [
         `Blast radius for ${result.targetKind}: ${result.target}`,
         `Depth: ${result.depth}    Total impacted files: ${result.totalFiles}`,
         "",
       ];
       if (result.totalFiles === 0) {
-        lines.push("No callers found — nothing else depends on this.");
+        lines.push("No callers or references found — nothing else depends on this.");
       } else {
         for (const [hop, files] of result.filesByDepth.entries()) {
           lines.push(`Hop ${hop} (${files.length} files):`);
@@ -440,53 +542,65 @@ async function dispatchGraphTool(
 
       // Zero-arg mode → ranked entry-point list
       if (!entrypoint) {
-        // Build a fresh detection using the file graph + per-file payloads from the cache.
-        // For efficiency we only list entry points by walking known symbols via the name index.
-        const fileGraph = await getOrBuildGraph(projectPath);
-        const nameIndex = await cache.getNameIndex();
-        const seenFiles = new Set<string>();
-        const payloads = [];
-        for (const refs of nameIndex.values()) {
-          for (const ref of refs) {
-            if (seenFiles.has(ref.file)) continue;
-            seenFiles.add(ref.file);
-            const p = await cache.getFilePayload(ref.file);
-            if (p) payloads.push(p);
+        const release = cache.acquireReader();
+        const readerToken = release.token;
+        try {
+          // Build a fresh detection using the file graph + per-file payloads from the cache.
+          // For efficiency we only list entry points by walking known symbols via the name index.
+          const fileGraph = await getGraphForRead(projectPath);
+          const nameIndex = await cache.getNameIndex(readerToken);
+          const seenFiles = new Set<string>();
+          const payloads = [];
+          for (const refs of nameIndex.values()) {
+            for (const ref of refs) {
+              if (seenFiles.has(ref.file)) continue;
+              seenFiles.add(ref.file);
+              const p = await cache.getFilePayload(ref.file, readerToken);
+              if (p) payloads.push(p);
+            }
           }
+          const entries = detectEntryPoints(fileGraph, payloads);
+          if (entries.length === 0) {
+            return "No entry points detected. The codebase may not have orphan files, conventional main() functions, or framework routes.";
+          }
+          const lines = [`Detected ${entries.length} entry point(s):`, ""];
+          for (const e of entries.slice(0, 50)) {
+            lines.push(`  ${e.name} (${e.file}${e.line ? `:${e.line}` : ""}) — ${e.reason}`);
+          }
+          if (entries.length > 50) lines.push(`  ... and ${entries.length - 50} more`);
+          lines.push("", "Pass `entrypoint` to trace forward call flow from any of these.");
+          return lines.join("\n");
+        } finally {
+          release();
         }
-        const entries = detectEntryPoints(fileGraph, payloads);
-        if (entries.length === 0) {
-          return "No entry points detected. The codebase may not have orphan files, conventional main() functions, or framework routes.";
-        }
-        const lines = [`Detected ${entries.length} entry point(s):`, ""];
-        for (const e of entries.slice(0, 50)) {
-          lines.push(`  ${e.name} (${e.file}${e.line ? `:${e.line}` : ""}) — ${e.reason}`);
-        }
-        if (entries.length > 50) lines.push(`  ... and ${entries.length - 50} more`);
-        lines.push("", "Pass `entrypoint` to trace forward call flow from any of these.");
-        return lines.join("\n");
       }
 
-      // Resolve symbol name → id via name index (file hint disambiguates)
-      const nameIndex = await cache.getNameIndex();
-      let refs = nameIndex.get(entrypoint) ?? [];
-      const fileHint = (args.file as string | undefined)?.trim();
-      if (fileHint) refs = refs.filter((r) => r.file === fileHint);
-      if (refs.length === 0) {
-        return `No symbol named "${entrypoint}" found${fileHint ? ` in ${fileHint}` : ""}.`;
-      }
-      if (refs.length > 1) {
-        const lines = [`Symbol "${entrypoint}" is ambiguous (${refs.length} matches). Pass \`file\` to disambiguate:`, ""];
-        for (const r of refs) lines.push(`  - ${r.file}`);
-        return lines.join("\n");
-      }
-      const depth = typeof args.depth === "number" ? args.depth : 5;
-      const tree = await getCallFlow(cache, refs[0].id, depth);
-      if (!tree) return `Could not load symbol "${entrypoint}".`;
+      // Hold one generation across name resolution and the complete traversal.
+      const release = cache.acquireReader();
+      const readerToken = release.token;
+      try {
+        const nameIndex = await cache.getNameIndex(readerToken);
+        let refs = nameIndex.get(entrypoint) ?? [];
+        const fileHint = (args.file as string | undefined)?.trim();
+        if (fileHint) refs = refs.filter((r) => r.file === fileHint);
+        if (refs.length === 0) {
+          return `No symbol named "${entrypoint}" found${fileHint ? ` in ${fileHint}` : ""}.`;
+        }
+        if (refs.length > 1) {
+          const lines = [`Symbol "${entrypoint}" is ambiguous (${refs.length} matches). Pass \`file\` to disambiguate:`, ""];
+          for (const r of refs) lines.push(`  - ${r.file}`);
+          return lines.join("\n");
+        }
+        const depth = typeof args.depth === "number" ? args.depth : 5;
+        const tree = await getCallFlow(cache, refs[0].id, depth, readerToken);
+        if (!tree) return `Could not load symbol "${entrypoint}".`;
 
-      const lines = [`Call flow from ${tree.symbolName} (${tree.file}:${tree.line})`, ""];
-      renderFlowTree(tree, "", true, lines);
-      return lines.join("\n");
+        const lines = [`Call flow from ${tree.symbolName} (${tree.file}:${tree.line})`, ""];
+        renderFlowTree(tree, "", true, lines);
+        return lines.join("\n");
+      } finally {
+        release();
+      }
     }
 
     case "codebase_symbol": {
@@ -509,13 +623,13 @@ async function dispatchGraphTool(
         lines.push("");
         lines.push(`Callers (${ctx.callers.length}):`);
         if (ctx.callers.length === 0) lines.push("  (none — possibly an entry point or unused)");
-        else for (const c of ctx.callers.slice(0, 30)) lines.push(`  ← ${c.file}:${c.line}`);
+        else for (const c of ctx.callers.slice(0, 30)) lines.push(`  ← ${c.file}:${c.line}${c.kind ? ` (${c.kind})` : ""}`);
         if (ctx.callers.length > 30) lines.push(`  ... and ${ctx.callers.length - 30} more`);
         lines.push("");
         lines.push(`Callees (${ctx.callees.length}):`);
         if (ctx.callees.length === 0) lines.push("  (none)");
         else for (const c of ctx.callees.slice(0, 30)) {
-          lines.push(`  → ${c.name} [${c.confidence}${c.resolved.length > 0 ? `, ${c.resolved.length} candidate(s)` : ""}]`);
+          lines.push(`  → ${c.name} [${c.confidence}${c.resolved.length > 0 ? `, ${c.resolved.length} candidate(s)` : ""}${c.kind ? `, ${c.kind}` : ""}]`);
         }
         if (ctx.callees.length > 30) lines.push(`  ... and ${ctx.callees.length - 30} more`);
         lines.push("---");

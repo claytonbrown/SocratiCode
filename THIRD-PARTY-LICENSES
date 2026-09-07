@@ -11,10 +11,12 @@ RUNTIME DEPENDENCIES
 @ast-grep/lang-c                  MIT License
 @ast-grep/lang-cpp                MIT License
 @ast-grep/lang-csharp             MIT License
-@ast-grep/lang-elixir             ISC License
+@ast-grep/lang-dart               MIT License
+@ast-grep/lang-elixir             MIT License
 @ast-grep/lang-go                 MIT License
 @ast-grep/lang-java               MIT License
 @ast-grep/lang-kotlin             MIT License
+@ast-grep/lang-lua                MIT License
 @ast-grep/lang-php                MIT License
 @ast-grep/lang-python             MIT License
 @ast-grep/lang-ruby               MIT License
@@ -24,15 +26,19 @@ RUNTIME DEPENDENCIES
 @lumis-sh/wasm-eex                MIT License
 @lumis-sh/wasm-heex               MIT License
 @google/generative-ai             Apache License 2.0
+@hono/node-server                 MIT License
 @modelcontextprotocol/sdk         MIT License
 @parcel/watcher                   MIT License
 @qdrant/js-client-rest            Apache License 2.0
 glob                              ISC License
 ignore                            MIT License
 ollama (JS client)                MIT License
+open                              MIT License
 openai                            Apache License 2.0
 proper-lockfile                   MIT License
 smol-toml                         BSD 3-Clause License
+tree-sitter-gdscript              MIT License
+undici                            MIT License
 web-tree-sitter                   MIT License
 zod                               MIT License
 

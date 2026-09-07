@@ -11,11 +11,8 @@ import {
   searchArtifacts,
 } from "../services/context-artifacts.js";
 import { ensureQdrantReady } from "../services/docker.js";
-import { getEmbeddingConfig } from "../services/embedding-config.js";
-import { getEmbeddingProvider } from "../services/embedding-provider.js";
 import { isIndexingInProgress } from "../services/indexer.js";
 import { logger } from "../services/logger.js";
-import { ensureOllamaReady } from "../services/ollama.js";
 import { getCollectionInfo, loadContextMetadata } from "../services/qdrant.js";
 
 export async function handleContextTool(
@@ -89,13 +86,6 @@ export async function handleContextTool(
 
     case "codebase_context_index": {
       await ensureQdrantReady();
-      // Only ensure Ollama infrastructure when using the Ollama embedding provider.
-      // For OpenAI/Google providers, just ensure the provider is initialized.
-      if (getEmbeddingConfig().embeddingProvider === "ollama") {
-        await ensureOllamaReady();
-      } else {
-        await getEmbeddingProvider();
-      }
 
       const config = await loadConfig(resolvedPath);
       if (!config?.artifacts?.length) {
@@ -129,13 +119,6 @@ export async function handleContextTool(
 
     case "codebase_context_search": {
       await ensureQdrantReady();
-      // Only ensure Ollama infrastructure when using the Ollama embedding provider.
-      // For OpenAI/Google providers, just ensure the provider is initialized.
-      if (getEmbeddingConfig().embeddingProvider === "ollama") {
-        await ensureOllamaReady();
-      } else {
-        await getEmbeddingProvider();
-      }
 
       const query = args.query as string;
       if (!query?.trim()) {

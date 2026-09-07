@@ -33,7 +33,7 @@ vi.mock("../../src/services/lock.js", () => ({
 
 vi.mock("../../src/services/watcher.js", () => ({
   isWatching: vi.fn().mockReturnValue(false),
-  startWatching: vi.fn().mockResolvedValue(true),
+  startWatchingAutomatically: vi.fn().mockResolvedValue(true),
   stopAllWatchers: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -62,7 +62,7 @@ import { getLockHolderPid, releaseAllLocks } from "../../src/services/lock.js";
 import { logger } from "../../src/services/logger.js";
 import { getProjectMetadata, listCodebaseCollections } from "../../src/services/qdrant.js";
 import { autoResumeIndexedProjects, awaitActiveIndexing, gracefulShutdown } from "../../src/services/startup.js";
-import { isWatching, startWatching, stopAllWatchers } from "../../src/services/watcher.js";
+import { isWatching, startWatchingAutomatically, stopAllWatchers } from "../../src/services/watcher.js";
 
 // Typed mock helpers
 const mockIsDockerAvailable = vi.mocked(isDockerAvailable);
@@ -76,7 +76,7 @@ const mockGetIndexingInProgress = vi.mocked(getIndexingInProgressProjects);
 const mockRequestCancellation = vi.mocked(requestCancellation);
 const mockGetLockHolderPid = vi.mocked(getLockHolderPid);
 const mockIsWatching = vi.mocked(isWatching);
-const mockStartWatching = vi.mocked(startWatching);
+const mockStartWatchingAutomatically = vi.mocked(startWatchingAutomatically);
 const mockStopAllWatchers = vi.mocked(stopAllWatchers);
 const mockReleaseAllLocks = vi.mocked(releaseAllLocks);
 
@@ -98,6 +98,24 @@ beforeEach(() => {
 // ── autoResumeIndexedProjects ────────────────────────────────────────────
 
 describe("autoResumeIndexedProjects", () => {
+  it("SOCRATICODE_AUTO_RESUME=off exits before infrastructure access and overrides a project list", async () => {
+    process.env.SOCRATICODE_AUTO_RESUME = " OFF ";
+    process.env.SOCRATICODE_AUTO_RESUME_PROJECTS = TEST_PROJECT;
+
+    await autoResumeIndexedProjects(TEST_PROJECT);
+
+    expect(mockIsDockerAvailable).not.toHaveBeenCalled();
+    expect(mockIsQdrantRunning).not.toHaveBeenCalled();
+    expect(mockListCollections).not.toHaveBeenCalled();
+    expect(mockGetPersistedStatus).not.toHaveBeenCalled();
+    expect(mockIndexProject).not.toHaveBeenCalled();
+    expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
+    expect(mockStartWatchingAutomatically).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      "Auto-resume: disabled by SOCRATICODE_AUTO_RESUME=off",
+    );
+  });
+
   it("skips when Docker is not available (managed mode)", async () => {
     mockIsDockerAvailable.mockResolvedValue(false);
 
@@ -208,7 +226,7 @@ describe("autoResumeIndexedProjects", () => {
     await autoResumeIndexedProjects(TEST_PROJECT);
 
     await vi.waitFor(() => {
-      expect(mockStartWatching).toHaveBeenCalledWith(TEST_PROJECT);
+      expect(mockStartWatchingAutomatically).toHaveBeenCalledWith(TEST_PROJECT);
     });
   });
 
@@ -224,7 +242,7 @@ describe("autoResumeIndexedProjects", () => {
 
     // Give the .then() time to fire
     await new Promise((r) => setTimeout(r, 50));
-    expect(mockStartWatching).not.toHaveBeenCalled();
+    expect(mockStartWatchingAutomatically).not.toHaveBeenCalled();
   });
 
   it("starts watcher and runs incremental update for completed index", async () => {
@@ -237,7 +255,7 @@ describe("autoResumeIndexedProjects", () => {
 
     await autoResumeIndexedProjects(TEST_PROJECT);
 
-    expect(mockStartWatching).toHaveBeenCalledWith(TEST_PROJECT);
+    expect(mockStartWatchingAutomatically).toHaveBeenCalledWith(TEST_PROJECT);
     expect(mockUpdateProjectIndex).toHaveBeenCalledWith(TEST_PROJECT);
 
     await vi.waitFor(() => {
@@ -276,7 +294,7 @@ describe("autoResumeIndexedProjects", () => {
 
     await autoResumeIndexedProjects(TEST_PROJECT);
 
-    expect(mockStartWatching).not.toHaveBeenCalled();
+    expect(mockStartWatchingAutomatically).not.toHaveBeenCalled();
   });
 
   it("handles updateProjectIndex failure gracefully for completed index", async () => {
@@ -357,7 +375,7 @@ describe("autoResumeIndexedProjects (multi-project modes)", () => {
     mockListCollections.mockResolvedValue([collA, collB]);
     mockGetPersistedStatus.mockResolvedValue("completed");
     mockIsWatching.mockReturnValue(false);
-    mockStartWatching.mockResolvedValue(true);
+    mockStartWatchingAutomatically.mockResolvedValue(true);
     mockUpdateProjectIndex.mockResolvedValue(noChanges);
   });
 
@@ -393,14 +411,14 @@ describe("autoResumeIndexedProjects (multi-project modes)", () => {
     // The whole point of sequential resume: B has not been touched while A's
     // update is still in flight.
     expect(mockUpdateProjectIndex).not.toHaveBeenCalledWith(dirB);
-    expect(mockStartWatching).not.toHaveBeenCalledWith(dirB);
+    expect(mockStartWatchingAutomatically).not.toHaveBeenCalledWith(dirB);
 
     resolveA(noChanges);
     await run;
 
     expect(mockUpdateProjectIndex).toHaveBeenCalledWith(dirB);
-    expect(mockStartWatching).toHaveBeenCalledWith(dirA);
-    expect(mockStartWatching).toHaveBeenCalledWith(dirB);
+    expect(mockStartWatchingAutomatically).toHaveBeenCalledWith(dirA);
+    expect(mockStartWatchingAutomatically).toHaveBeenCalledWith(dirB);
   });
 
   it("skips list entries whose directory does not exist, with a warning, and resumes the rest", async () => {
@@ -556,7 +574,7 @@ describe("autoResumeIndexedProjects (multi-project modes)", () => {
 
   it("still runs the incremental catch-up when watcher startup throws", async () => {
     process.env.SOCRATICODE_AUTO_RESUME_PROJECTS = dirA;
-    mockStartWatching.mockRejectedValue(new Error("inotify limit reached"));
+    mockStartWatchingAutomatically.mockRejectedValue(new Error("inotify limit reached"));
 
     await autoResumeIndexedProjects();
 
@@ -580,7 +598,7 @@ describe("autoResumeIndexedProjects (multi-project modes)", () => {
       expect.objectContaining({ value: "yes" }),
     );
     // Default behavior still runs for the provided (cwd) project.
-    expect(mockStartWatching).toHaveBeenCalledWith(dirA);
+    expect(mockStartWatchingAutomatically).toHaveBeenCalledWith(dirA);
     expect(mockUpdateProjectIndex).toHaveBeenCalledWith(dirA);
   });
 });

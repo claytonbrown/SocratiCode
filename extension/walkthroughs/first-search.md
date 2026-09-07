@@ -4,12 +4,16 @@ Now your codebase is indexed, two things to try.
 
 ## Ask your AI assistant
 
-In Copilot agent mode, Cline, Continue or Roo Code, ask any of:
+In Microsoft VS Code's native Agent Chat, ask any of:
 
 - "Where is authentication handled in this project?"
 - "What breaks if I change the function `processOrder`?"
 - "Trace the execution flow of the cron job that runs nightly."
 - "Show me every place that talks to the `users` table."
+
+In another compatible editor, first verify the registered MCP provider using
+that host's [integration instructions](https://github.com/giancarloerra/socraticode#plugins-and-host-integrations),
+then use the editor's available agent or chat interface.
 
 The assistant will call SocratiCode's MCP tools (`codebase_search`,
 `codebase_impact`, `codebase_flow`, `codebase_symbol`, etc.) automatically.

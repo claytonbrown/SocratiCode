@@ -1,7 +1,7 @@
 {
   "name": "socraticode",
   "mcpName": "io.github.giancarloerra/socraticode",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "description": "SocratiCode — MCP server for local codebase indexing, semantic search, and code dependency graphs. All private, all local via Docker.",
   "type": "module",
   "main": "dist/index.js",
@@ -81,12 +81,13 @@
     "@ast-grep/lang-swift": "^0.0.7",
     "@ast-grep/napi": "^0.40.5",
     "@google/generative-ai": "^0.24.1",
+    "@hono/node-server": "~1.19.15",
     "@lumis-sh/wasm-eex": "^0.26.1",
     "@lumis-sh/wasm-heex": "^0.26.2",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@parcel/watcher": "^2.5.6",
-    "@qdrant/js-client-rest": "^1.17.0",
-    "glob": "^11.0.1",
+    "@qdrant/js-client-rest": "~1.18.0",
+    "glob": "^10.5.0",
     "ignore": "^7.0.3",
     "ollama": "^0.5.14",
     "open": "^10.2.0",
@@ -96,6 +97,9 @@
     "undici": "^6.28.0",
     "web-tree-sitter": "^0.26.12",
     "zod": "^3.24.2"
+  },
+  "optionalDependencies": {
+    "tree-sitter-gdscript": "6.1.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4",
@@ -115,6 +119,9 @@
     "vitest": {
       "vite": "^7.3.6"
     },
-    "@hono/node-server": "^2.0.5"
+    "postcss": "8.5.23",
+    "release-it": {
+      "undici": "7.29.0"
+    }
   }
 }

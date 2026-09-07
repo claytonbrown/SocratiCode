@@ -109,10 +109,13 @@ export async function generateEmbeddings(
  * Generate a single query embedding, prefixed with the configured query task
  * prefix (`EMBEDDING_QUERY_PREFIX`; see `queryPrefix` in embedding-config.ts).
  */
-export async function generateQueryEmbedding(query: string): Promise<number[]> {
+export async function generateQueryEmbedding(
+  query: string,
+  effectiveQueryPrefix: string = queryPrefix(),
+): Promise<number[]> {
   const provider = await getEmbeddingProvider();
   return withRetry(
-    () => provider.embedSingle(`${queryPrefix()}${query}`),
+    () => provider.embedSingle(`${effectiveQueryPrefix}${query}`),
     "Query embedding",
   );
 }
@@ -137,7 +140,19 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
  * artifacts — whose `filePath` is a `context:<name>:<path>` identifier — it
  * drops the artifact name along with the path.
  */
-export function prepareDocumentText(content: string, filePath: string): string {
-  const head = documentIncludesPath() ? `${filePath}\n` : "";
-  return `${documentPrefix()}${head}${content}`;
+export interface DocumentTextProfile {
+  documentPrefix: string;
+  documentIncludesPath: boolean;
+}
+
+export function prepareDocumentText(
+  content: string,
+  filePath: string,
+  profile: DocumentTextProfile = {
+    documentPrefix: documentPrefix(),
+    documentIncludesPath: documentIncludesPath(),
+  },
+): string {
+  const head = profile.documentIncludesPath ? `${filePath}\n` : "";
+  return `${profile.documentPrefix}${head}${content}`;
 }

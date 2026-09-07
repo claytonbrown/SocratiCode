@@ -70,6 +70,7 @@ import {
   loadNameShard,
   loadReverseShard,
   resetSymbolGraphCollectionCache,
+  StorageReadError,
   SymbolGraphPointTooLargeError,
   saveNameShard,
   saveReverseShard,
@@ -198,7 +199,7 @@ describe("multi-part symbol shards (#99)", () => {
     expect(continuation).toBeDefined();
     coll?.delete(String(continuation?.id));
 
-    await expect(loadNameShard(PROJ, "m")).resolves.toBeNull();
+    await expect(loadNameShard(PROJ, "m")).rejects.toThrow(StorageReadError);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("missing continuation parts"),
       expect.objectContaining({ shardKey: "m" }),
@@ -223,8 +224,7 @@ describe("multi-part symbol shards (#99)", () => {
     failUpsertAt = upsertCount + 2;
     await expect(saveNameShard(PROJ, "w", newRecord)).rejects.toThrow();
 
-    const loaded = await loadNameShard(PROJ, "w");
-    expect(loaded).toBeNull(); // never a silent old/new key mixture
+    await expect(loadNameShard(PROJ, "w")).rejects.toThrow(StorageReadError);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("different write"),
       expect.objectContaining({ shardKey: "w" }),
@@ -249,7 +249,7 @@ describe("multi-part symbol shards (#99)", () => {
       const { write, ...restPayload } = p.payload as Record<string, unknown>;
       coll?.set(String(p.id), { ...p, payload: restPayload });
     }
-    await expect(loadNameShard(PROJ, "x")).resolves.toBeNull();
+    await expect(loadNameShard(PROJ, "x")).rejects.toThrow(StorageReadError);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("malformed header"),
       expect.objectContaining({ shardKey: "x" }),
@@ -265,11 +265,30 @@ describe("multi-part symbol shards (#99)", () => {
       ...(continuation as StoredPoint),
       payload: { ...(continuation as StoredPoint).payload, part: 99 },
     });
-    await expect(loadNameShard(PROJ, "y")).resolves.toBeNull();
+    await expect(loadNameShard(PROJ, "y")).rejects.toThrow(StorageReadError);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("different write or is malformed"),
       expect.objectContaining({ shardKey: "y" }),
     );
+  });
+
+  it("refuses a shard with invalid declared parts count (0, 1, or non-numeric)", async () => {
+    await saveNameShard(PROJ, "k", { sym: refsFor("sym", 1) });
+    const coll = store.get(INDEX_COLL);
+    const primary = pointsInIndex()[0];
+    expect(primary).toBeDefined();
+
+    // 1. parts: 0
+    coll?.set(String(primary.id), { ...primary, payload: { ...primary.payload, parts: 0, write: "w1" } });
+    await expect(loadNameShard(PROJ, "k")).rejects.toThrow(StorageReadError);
+
+    // 2. parts: 1 (only multipart >= 2 is valid when declared)
+    coll?.set(String(primary.id), { ...primary, payload: { ...primary.payload, parts: 1, write: "w1" } });
+    await expect(loadNameShard(PROJ, "k")).rejects.toThrow(StorageReadError);
+
+    // 3. parts: "two" (non-numeric)
+    coll?.set(String(primary.id), { ...primary, payload: { ...primary.payload, parts: "two", write: "w1" } });
+    await expect(loadNameShard(PROJ, "k")).rejects.toThrow(StorageReadError);
   });
 
   it("throws a named error when one ENTRY alone exceeds a part budget", async () => {

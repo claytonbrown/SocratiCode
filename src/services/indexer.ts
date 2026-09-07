@@ -16,42 +16,42 @@ import {
   INDEX_BATCH_SIZE,
   indexExtensionlessEnabled,
   MAX_AVG_LINE_LENGTH,
-  MAX_CHUNK_CHARS,MAX_FILE_BYTES,
+  MAX_CHUNK_CHARS,
   SPECIAL_FILES,
   SUPPORTED_EXTENSIONS
 } from "../constants.js";
 import type { FileChunk } from "../types.js";
-import { ensureDynamicLanguages, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
+import { ensureDynamicLanguages, gdscriptParserAvailable, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
 import { ensureArtifactsIndexed, loadConfig, removeAllArtifacts } from "./context-artifacts.js";
 import { analyzeElixirTemplate, ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir-templates.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import {
+  documentTextProfile,
+  ensureEffectiveEmbeddingReady,
+  profileExtensionLanguageMap,
+  resolveEffectiveIndexProfile,
+  withEffectiveEmbedding,
+} from "./index-profile.js";
 import { acquireProjectLock, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
 import {
+  type CollectionInfo,
   deleteCollection,
   deleteFileChunks,
   deleteProjectMetadata,
   ensureCollection,
   getCollectionInfo,
   getProjectMetadata,
+  loadProjectEffectiveProfile,
   loadProjectHashes,
   saveProjectMetadata,
   upsertPreEmbeddedChunks,
 } from "./qdrant.js";
-import { updateChangedFilesSymbolGraph } from "./symbol-graph-incremental.js";
-import { loadSymbolGraphMeta } from "./symbol-graph-store.js";
 
 export const FILE_SCAN_BATCH = 50; // Number of files to scan/chunk in parallel (I/O only, no network)
 
-/**
- * Phase F: maximum number of changed/removed files for which the watcher path
- * patches the symbol graph in-place rather than rebuilding it from scratch.
- * Above this threshold a full rebuild is faster than re-running per-file
- * extraction + shard merging, since most shards would be touched anyway.
- */
-const INCREMENTAL_SYMBOL_THRESHOLD = 50;
 
 /** State for tracking indexed files per project (loaded from Qdrant on first use) */
 const projectHashes = new Map<string, Map<string, string>>();
@@ -239,13 +239,17 @@ export function chunkId(relativePath: string, startLine: number): string {
 }
 
 /** Check if a file should be indexed based on extension or name */
-export function isIndexableFile(fileName: string, extraExts?: Set<string>): boolean {
+export function isIndexableFile(
+  fileName: string,
+  extraExts?: Set<string>,
+  extensionLanguageMap: Map<string, string> = EXTENSION_LANGUAGE_MAP,
+): boolean {
   if (SPECIAL_FILES.has(fileName)) return true;
   const ext = path.extname(fileName).toLowerCase();
   if (SUPPORTED_EXTENSIONS.has(ext)) return true;
   // Extensions mapped to a real language via EXTENSION_LANGUAGE_MAP are
   // first-class source files, not plaintext extras.
-  if (EXTENSION_LANGUAGE_MAP.has(ext)) return true;
+  if (extensionLanguageMap.has(ext)) return true;
   // Check extra extensions (from env var + tool parameter)
   const extras = extraExts ?? EXTRA_EXTENSIONS;
   return extras.has(ext);
@@ -285,6 +289,11 @@ const TOP_LEVEL_KINDS: Record<string, string[]> = {
   // findAstBoundaries fuses each signature/body pair into one region.
   dart:       ["class_definition", "mixin_declaration", "enum_declaration", "extension_declaration", "type_alias", "function_signature", "function_body"],
   elixir:     ["call"],
+  // GDScript (Godot)
+  gdscript:   ["function_definition", "class_definition", "variable_statement",
+               "export_variable_statement", "onready_variable_statement",
+               "signal_statement", "const_statement", "enum_definition",
+               "extends_statement", "class_name_statement"],
 };
 
 /** Minimum lines for a chunk to stand on its own (otherwise merge with neighbors) */
@@ -305,6 +314,10 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
   const langKey = String(lang);
   const kinds = TOP_LEVEL_KINDS[langKey];
   if (!kinds) return [];
+  // GDScript parser is registered dynamically and may be unavailable on
+  // platforms without a compatible prebuild (e.g. linux-arm64). Skip AST
+  // chunking there — files fall back to line-based chunking.
+  if (langKey === "gdscript" && !gdscriptParserAvailable) return [];
 
   try {
     const root = parse(lang, source).root();
@@ -322,7 +335,8 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
           || parent.kind() === "compilation_unit"
           // Depth 2: e.g., class inside namespace
           || (grandparent && (grandparent.kind() === "program" || grandparent.kind() === "source_file"
-            || grandparent.kind() === "translation_unit" || grandparent.kind() === "compilation_unit"));
+            || grandparent.kind() === "translation_unit" || grandparent.kind() === "compilation_unit"
+            || grandparent.kind() === "source"));
 
         if (isTopLevel) {
           regions.push({ startLine: range.start.line, endLine: range.end.line + 1 });
@@ -354,7 +368,10 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
  * intentionally simple — the provider's pre-truncation is the last-resort
  * defence; this cap ensures chunks are already within bounds before that.
  */
-function applyCharCap(chunks: FileChunk[]): FileChunk[] {
+function applyCharCap(
+  chunks: FileChunk[],
+  maxChunkChars: number = MAX_CHUNK_CHARS,
+): FileChunk[] {
   // Terminal invariant: never emit a chunk with no non-whitespace content.
   // Four of the five `return` paths in chunkFileContent pass through here (the
   // fifth returns []), so this is the one place that can guarantee the property
@@ -367,11 +384,11 @@ function applyCharCap(chunks: FileChunk[]): FileChunk[] {
   // non-whitespace content sits past MAX_CHUNK_CHARS pass the filter and then be
   // truncated back into a blank chunk, so the invariant would not actually hold.
   const capped =
-    chunks.every((c) => c.content.length <= MAX_CHUNK_CHARS)
+    chunks.every((c) => c.content.length <= maxChunkChars)
       ? chunks
       : chunks.map((c) =>
-          c.content.length > MAX_CHUNK_CHARS
-            ? { ...c, content: c.content.substring(0, MAX_CHUNK_CHARS) }
+          c.content.length > maxChunkChars
+            ? { ...c, content: c.content.substring(0, maxChunkChars) }
             : c,
         );
   return capped.filter((c) => c.content.trim().length > 0);
@@ -392,13 +409,14 @@ function chunkByCharacters(
   relativePath: string,
   content: string,
   language: string,
+  maxChunkChars: number,
 ): FileChunk[] {
   const chunks: FileChunk[] = [];
   let offset = 0;
   let currentLine = 1;
 
   while (offset < content.length) {
-    let end = Math.min(offset + MAX_CHUNK_CHARS, content.length);
+    let end = Math.min(offset + maxChunkChars, content.length);
 
     // Scan backwards from the hard limit to find a safe split boundary.
     // If none is found within the window, fall through and split at the limit.
@@ -448,7 +466,13 @@ export function chunkFileContent(
   filePath: string,
   relativePath: string,
   content: string,
+  options: {
+    maxChunkChars?: number;
+    extensionLanguageMap?: Map<string, string>;
+  } = {},
 ): FileChunk[] {
+  const maxChunkChars = options.maxChunkChars ?? MAX_CHUNK_CHARS;
+  const extensionLanguageMap = options.extensionLanguageMap ?? EXTENSION_LANGUAGE_MAP;
   const lines = content.split("\n");
   let ext = path.extname(filePath).toLowerCase();
   // Extensionless files (not SPECIAL_FILES) inherit their language/grammar from
@@ -466,7 +490,7 @@ export function chunkFileContent(
     if (!detected) return [];
     ext = detected;
   }
-  const language = getLanguageFromExtension(ext);
+  const language = getLanguageFromExtension(ext, extensionLanguageMap);
 
   // Detect minified/bundled content before any other branching: a high
   // average line length means line-based chunks would be huge single lines
@@ -477,7 +501,10 @@ export function chunkFileContent(
       relativePath,
       avgLineLength: Math.round(avgLineLength),
     });
-    return applyCharCap(chunkByCharacters(filePath, relativePath, content, language));
+    return applyCharCap(
+      chunkByCharacters(filePath, relativePath, content, language, maxChunkChars),
+      maxChunkChars,
+    );
   }
 
   // Small files: single chunk regardless of language
@@ -491,21 +518,27 @@ export function chunkFileContent(
       endLine: lines.length,
       language,
       type: "code",
-    }]);
+    }], maxChunkChars);
   }
 
   // Try AST-aware chunking for supported languages and mixed Elixir templates.
-  const astLang = getAstGrepLang(ext);
+  const astLang = getAstGrepLang(ext, extensionLanguageMap);
   const regions = isElixirTemplateExtension(ext)
     ? (analyzeElixirTemplate(content, ext)?.regions ?? [])
     : astLang ? findAstBoundaries(content, astLang) : [];
 
   if (regions.length > 0) {
-    return applyCharCap(chunkByAstRegions(filePath, relativePath, lines, language, regions));
+    return applyCharCap(
+      chunkByAstRegions(filePath, relativePath, lines, language, regions),
+      maxChunkChars,
+    );
   }
 
   // Fallback: line-based chunking
-  return applyCharCap(chunkByLines(filePath, relativePath, lines, language));
+  return applyCharCap(
+    chunkByLines(filePath, relativePath, lines, language),
+    maxChunkChars,
+  );
 }
 
 /**
@@ -663,6 +696,7 @@ function chunkByLines(
 export async function getIndexableFiles(
   projectPath: string,
   extraExts?: Set<string>,
+  extensionLanguageMap: Map<string, string> = EXTENSION_LANGUAGE_MAP,
 ): Promise<string[]> {
   const ig = createIgnoreFilter(projectPath);
 
@@ -680,7 +714,7 @@ export async function getIndexableFiles(
   for (const relativePath of allFiles) {
     if (shouldIgnore(ig, relativePath)) continue;
     const fileName = path.basename(relativePath);
-    if (isIndexableFile(fileName, extraExts)) {
+    if (isIndexableFile(fileName, extraExts, extensionLanguageMap)) {
       kept.push(relativePath);
       continue;
     }
@@ -743,7 +777,7 @@ export async function indexProject(
   // Smart re-index: check if collection already has data.
   // getCollectionInfo now throws on transient errors (instead of returning null),
   // so a Qdrant blip will abort the operation rather than trigger a false clean-start.
-  let existingInfo: { pointsCount: number; status: string } | null;
+  let existingInfo: CollectionInfo | null;
   try {
     existingInfo = await getCollectionInfo(collection);
   } catch (err) {
@@ -755,11 +789,27 @@ export async function indexProject(
     throw new Error(`Failed to check collection state for ${collection}: ${msg}. Aborting to avoid accidental data loss.`);
   }
   const hasExistingData = existingInfo !== null && existingInfo.pointsCount > 0;
+  const storedProfile = existingInfo === null
+    ? null
+    : await loadProjectEffectiveProfile(collection);
+  const effectiveProfile = resolveEffectiveIndexProfile(
+    "code",
+    storedProfile,
+    hasExistingData,
+    existingInfo?.denseVectorSize,
+  );
+  const effectiveExtensionMap = profileExtensionLanguageMap(effectiveProfile);
+  const effectiveMaxFileBytes = effectiveProfile.maxFileBytes;
+  if (effectiveMaxFileBytes === undefined) {
+    throw new Error(`Code index profile for ${collection} has no maxFileBytes value.`);
+  }
+  const effectiveDocumentText = documentTextProfile(effectiveProfile);
+  await ensureEffectiveEmbeddingReady(effectiveProfile, onProgress);
 
   // ensureCollection is idempotent — creates if absent, no-op if exists.
   // IMPORTANT: We NEVER delete a collection here. Only removeProjectIndex
   // (called by the codebase_remove tool) is allowed to delete collections.
-  await ensureCollection(collection);
+  await withEffectiveEmbedding(effectiveProfile, () => ensureCollection(collection));
 
   if (hasExistingData) {
     if (hashes.size > 0) {
@@ -782,9 +832,25 @@ export async function indexProject(
     hashes.clear();
   }
 
+  // Persist the profile before the first vector write. A crash between an
+  // upsert and the first batch checkpoint must not leave unprofiled new points.
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    0,
+    hashes.size,
+    hashes,
+    "in-progress",
+    effectiveProfile,
+  );
+
   // ── Phase 1: Scan and chunk files ──
   progress.phase = "scanning files";
-  const files = await getIndexableFiles(resolvedPath, extraExtensions);
+  const files = await getIndexableFiles(
+    resolvedPath,
+    extraExtensions,
+    effectiveExtensionMap,
+  );
   if (files.some((file) => isElixirTemplateExtension(path.extname(file)))) {
     await ensureElixirTemplateParsers();
   }
@@ -799,6 +865,7 @@ export async function indexProject(
   }
 
   const chunkedFiles: ChunkedFile[] = [];
+  const oversizedFiles = new Set<string>();
   let skippedCount = 0;
 
   for (let i = 0; i < files.length; i += FILE_SCAN_BATCH) {
@@ -808,8 +875,9 @@ export async function indexProject(
         const absolutePath = path.join(resolvedPath, relativePath);
         try {
           const stat = await fsp.stat(absolutePath);
-          if (stat.size > MAX_FILE_BYTES) {
+          if (stat.size > effectiveMaxFileBytes) {
             onProgress?.(`Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`);
+            oversizedFiles.add(relativePath);
             return null;
           }
           const content = await fsp.readFile(absolutePath, "utf-8");
@@ -820,7 +888,10 @@ export async function indexProject(
             return null;
           }
 
-          const chunks = chunkFileContent(absolutePath, relativePath, content);
+          const chunks = chunkFileContent(absolutePath, relativePath, content, {
+            maxChunkChars: effectiveProfile.maxChunkChars,
+            extensionLanguageMap: effectiveExtensionMap,
+          });
           return { relativePath, absolutePath, contentHash, chunks };
         } catch {
           return null;
@@ -847,7 +918,9 @@ export async function indexProject(
     }
 
     // Handle deleted files
-    const currentFileSet = new Set(files);
+    const currentFileSet = new Set(
+      files.filter((relativePath) => !oversizedFiles.has(relativePath)),
+    );
     for (const [filePath] of hashes) {
       if (!currentFileSet.has(filePath)) {
         await deleteFileChunks(collection, filePath);
@@ -899,7 +972,21 @@ export async function indexProject(
     }
 
     if (batchChunkData.length === 0) {
+      for (const file of fileBatch) {
+        hashes.set(file.relativePath, file.contentHash);
+      }
+      progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
+      await saveProjectMetadata(
+        collection,
+        resolvedPath,
+        files.length,
+        hashes.size,
+        hashes,
+        "in-progress",
+        effectiveProfile,
+      );
       progress.batchesProcessed = batchNum;
+      onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
       continue;
     }
 
@@ -907,10 +994,14 @@ export async function indexProject(
     progress.phase = `generating embeddings (batch ${batchNum}/${totalBatches})`;
     onProgress?.(`Batch ${batchNum}/${totalBatches}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files)...`);
 
-    const batchTexts = batchChunkData.map((c) => prepareDocumentText(c.chunk.content, c.chunk.relativePath));
-    const batchEmbeddings = await generateEmbeddings(batchTexts, (processed) => {
-      progress.chunksProcessed = globalChunksProcessed + processed;
-    });
+    const batchTexts = batchChunkData.map((c) =>
+      prepareDocumentText(c.chunk.content, c.chunk.relativePath, effectiveDocumentText),
+    );
+    const batchEmbeddings = await withEffectiveEmbedding(effectiveProfile, () =>
+      generateEmbeddings(batchTexts, (processed) => {
+        progress.chunksProcessed = globalChunksProcessed + processed;
+      }),
+    );
     globalChunksProcessed += batchChunkData.length;
 
     // Upsert this batch to Qdrant
@@ -958,7 +1049,15 @@ export async function indexProject(
 
     // Checkpoint: persist hashes after each batch so progress survives crashes
     progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
-    await saveProjectMetadata(collection, resolvedPath, files.length, hashes.size, hashes, "in-progress");
+    await saveProjectMetadata(
+      collection,
+      resolvedPath,
+      files.length,
+      hashes.size,
+      hashes,
+      "in-progress",
+      effectiveProfile,
+    );
     progress.batchesProcessed = batchNum;
     onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
   }
@@ -968,7 +1067,15 @@ export async function indexProject(
 
   // Final metadata save
   progress.phase = "saving metadata";
-  await saveProjectMetadata(collection, resolvedPath, filesIndexed, hashes.size, hashes, "completed");
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    filesIndexed,
+    hashes.size,
+    hashes,
+    "completed",
+    effectiveProfile,
+  );
 
   // Auto-build code graph
   progress.phase = "building code graph";
@@ -1064,7 +1171,7 @@ export async function updateProjectIndex(
 
   // Ensure collection exists — getCollectionInfo now throws on transient errors,
   // so a network blip will abort rather than cascade into a destructive fallback.
-  let info: { pointsCount: number; status: string } | null;
+  let info: CollectionInfo | null;
   try {
     info = await getCollectionInfo(collection);
   } catch (err) {
@@ -1096,15 +1203,43 @@ export async function updateProjectIndex(
     return { added: result.filesIndexed, updated: 0, removed: 0, chunksCreated: result.chunksCreated, cancelled: result.cancelled };
   }
 
+  const storedProfile = await loadProjectEffectiveProfile(collection);
+  const effectiveProfile = resolveEffectiveIndexProfile(
+    "code",
+    storedProfile,
+    true,
+    info.denseVectorSize,
+  );
+  const effectiveExtensionMap = profileExtensionLanguageMap(effectiveProfile);
+  const effectiveMaxFileBytes = effectiveProfile.maxFileBytes;
+  if (effectiveMaxFileBytes === undefined) {
+    throw new Error(`Code index profile for ${collection} has no maxFileBytes value.`);
+  }
+  const effectiveDocumentText = documentTextProfile(effectiveProfile);
+  await ensureEffectiveEmbeddingReady(effectiveProfile, onProgress);
+
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    0,
+    hashes.size,
+    hashes,
+    "in-progress",
+    effectiveProfile,
+  );
+
   // ── Phase 1: Scan files and identify changes ──
   progress.phase = "scanning for changes";
-  const currentFiles = await getIndexableFiles(resolvedPath, extraExtensions);
+  const currentFiles = await getIndexableFiles(
+    resolvedPath,
+    extraExtensions,
+    effectiveExtensionMap,
+  );
   if (currentFiles.some((file) => isElixirTemplateExtension(path.extname(file)))) {
     await ensureElixirTemplateParsers();
   }
   progress.filesTotal = currentFiles.length;
   onProgress?.(`Found ${currentFiles.length} indexable files, scanning for changes...`);
-  const currentFileSet = new Set(currentFiles);
 
   interface ChangedFile {
     relativePath: string;
@@ -1115,6 +1250,7 @@ export async function updateProjectIndex(
   }
 
   const changedFiles: ChangedFile[] = [];
+  const oversizedFiles = new Set<string>();
 
   for (let i = 0; i < currentFiles.length; i += FILE_SCAN_BATCH) {
     const batch = currentFiles.slice(i, i + FILE_SCAN_BATCH);
@@ -1123,8 +1259,9 @@ export async function updateProjectIndex(
         const absolutePath = path.join(resolvedPath, relativePath);
         try {
           const stat = await fsp.stat(absolutePath);
-          if (stat.size > MAX_FILE_BYTES) {
+          if (stat.size > effectiveMaxFileBytes) {
             onProgress?.(`Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`);
+            oversizedFiles.add(relativePath);
             return null;
           }
           const content = await fsp.readFile(absolutePath, "utf-8");
@@ -1133,7 +1270,10 @@ export async function updateProjectIndex(
 
           if (existingHash === contentHash) return null;
 
-          const chunks = chunkFileContent(absolutePath, relativePath, content);
+          const chunks = chunkFileContent(absolutePath, relativePath, content, {
+            maxChunkChars: effectiveProfile.maxChunkChars,
+            extensionLanguageMap: effectiveExtensionMap,
+          });
           return { relativePath, absolutePath, contentHash, chunks, isNew: !existingHash };
         } catch {
           return null;
@@ -1147,6 +1287,9 @@ export async function updateProjectIndex(
 
   const unchangedCount = currentFiles.length - changedFiles.length;
   onProgress?.(`${changedFiles.length} files changed, ${unchangedCount} unchanged/skipped`);
+  const currentFileSet = new Set(
+    currentFiles.filter((relativePath) => !oversizedFiles.has(relativePath)),
+  );
 
   let added = 0;
   let updated = 0;
@@ -1203,7 +1346,23 @@ export async function updateProjectIndex(
       }
 
       if (batchChunkData.length === 0) {
+        for (const file of fileBatch) {
+          hashes.set(file.relativePath, file.contentHash);
+          if (file.isNew) added++;
+          else updated++;
+        }
+        progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
+        await saveProjectMetadata(
+          collection,
+          resolvedPath,
+          currentFiles.length,
+          hashes.size,
+          hashes,
+          "in-progress",
+          effectiveProfile,
+        );
         progress.batchesProcessed = batchNum;
+        onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${chunksCreated} chunks so far)`);
         continue;
       }
 
@@ -1211,10 +1370,14 @@ export async function updateProjectIndex(
       progress.phase = `generating embeddings (batch ${batchNum}/${totalBatches})`;
       onProgress?.(`Batch ${batchNum}/${totalBatches}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files changed)...`);
 
-      const batchTexts = batchChunkData.map((c) => prepareDocumentText(c.chunk.content, c.chunk.relativePath));
-      const batchEmbeddings = await generateEmbeddings(batchTexts, (processed) => {
-        progress.chunksProcessed = globalChunksProcessed + processed;
-      });
+      const batchTexts = batchChunkData.map((c) =>
+        prepareDocumentText(c.chunk.content, c.chunk.relativePath, effectiveDocumentText),
+      );
+      const batchEmbeddings = await withEffectiveEmbedding(effectiveProfile, () =>
+        generateEmbeddings(batchTexts, (processed) => {
+          progress.chunksProcessed = globalChunksProcessed + processed;
+        }),
+      );
       globalChunksProcessed += batchChunkData.length;
 
       // Upsert this batch to Qdrant
@@ -1254,7 +1417,15 @@ export async function updateProjectIndex(
 
       // Checkpoint: persist hashes after each batch
       progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
-      await saveProjectMetadata(collection, resolvedPath, currentFiles.length, hashes.size, hashes, "in-progress");
+      await saveProjectMetadata(
+        collection,
+        resolvedPath,
+        currentFiles.length,
+        hashes.size,
+        hashes,
+        "in-progress",
+        effectiveProfile,
+      );
       progress.batchesProcessed = batchNum;
       onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${chunksCreated} chunks so far)`);
     }
@@ -1273,62 +1444,32 @@ export async function updateProjectIndex(
   }
 
   // Persist updated hashes
-  await saveProjectMetadata(collection, resolvedPath, currentFiles.length, hashes.size, hashes, "completed");
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    currentFiles.length,
+    hashes.size,
+    hashes,
+    "completed",
+    effectiveProfile,
+  );
 
   // Auto-rebuild code graph if any files changed (Phase F).
   //
-  // Strategy:
-  //   - If a symbol-graph already exists AND the change set is small
-  //     (≤ INCREMENTAL_SYMBOL_THRESHOLD files), do a fast file-import-graph
-  //     rebuild then patch the symbol graph per-file via
-  //     `updateChangedFilesSymbolGraph`.
-  //   - Otherwise fall back to a full `rebuildGraph()` that also rebuilds
-  //     the symbol graph end-to-end.
+  // While every changed or removed file requires a complete symbol-graph rebuild,
+  // bypass the incremental branch and perform one complete graph rebuild.
   if (added > 0 || updated > 0 || removed > 0) {
     progress.phase = "building code graph";
-    const projectId = projectIdFromPath(resolvedPath);
     const totalChanged = changedFiles.length + removedRelPaths.length;
-    const meta = await loadSymbolGraphMeta(projectId).catch(() => null);
-    const useIncremental = meta !== null && totalChanged <= INCREMENTAL_SYMBOL_THRESHOLD;
 
     try {
       onProgress?.(
-        useIncremental
-          ? `Building file graph + incrementally updating ${totalChanged} symbol payload(s)...`
+        totalChanged > 0
+          ? `Building code dependency graph (${totalChanged} file(s) changed, full rebuild)...`
           : "Building code dependency graph (full rebuild)...",
       );
-      const graph = await rebuildGraph(resolvedPath, { skipSymbolGraph: useIncremental });
+      const graph = await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
       onProgress?.(`Code graph built: ${graph.nodes.length} files, ${graph.edges.length} edges`);
-
-      if (useIncremental) {
-        try {
-          const result = await updateChangedFilesSymbolGraph(
-            projectId,
-            resolvedPath,
-            graph,
-            changedFiles.map((f) => f.relativePath),
-            removedRelPaths,
-          );
-          if (result.fullRebuildRequired) {
-            // Meta vanished between checks — fall back to a full symbol rebuild.
-            onProgress?.("Symbol graph meta missing — falling back to full rebuild");
-            await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
-          } else {
-            onProgress?.(
-              `Symbol graph patched: +${result.symbolsDelta} symbols, ` +
-                `+${result.edgesDelta} edges (${result.filesChanged} changed, ${result.filesRemoved} removed)`,
-            );
-          }
-        } catch (incErr) {
-          // Last-resort fallback: full rebuild. Never let watcher fail.
-          const incMsg = incErr instanceof Error ? incErr.message : String(incErr);
-          logger.warn("Incremental symbol-graph update failed; falling back to full rebuild", {
-            projectPath: resolvedPath,
-            error: incMsg,
-          });
-          await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
-        }
-      }
     } catch (graphErr) {
       const graphMsg = graphErr instanceof Error ? graphErr.message : String(graphErr);
       logger.warn("Code graph build failed during incremental update (non-fatal)", { projectPath: resolvedPath, error: graphMsg });

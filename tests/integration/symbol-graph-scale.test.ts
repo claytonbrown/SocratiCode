@@ -18,8 +18,8 @@
  *   2. Symbol-graph meta is persisted with the expected counts.
  *   3. Cold queries (codebase_impact / codebase_symbol via the cache) return
  *      results within a small budget after a fresh process state.
- *   4. Phase F incremental update for a single changed file is at least
- *      4× faster than a full rebuild (the whole point of Phase F).
+ *   4. A changed file requests a safe full symbol-graph rebuild without
+ *      mutating the active generation before that rebuild completes.
  *
  * Skipped automatically when Docker is unavailable.
  */
@@ -59,7 +59,6 @@ const TOTAL_SYMBOLS = N_FILES * SYMBOLS_PER_FILE;
 // Wall-clock budgets (intentionally loose — we only fail on order-of-magnitude regressions).
 const FULL_REBUILD_BUDGET_MS = LARGE ? 10 * 60_000 : 90_000; // 90s for 1k files locally; 10min for 10k
 const COLD_QUERY_BUDGET_MS = 5_000;
-const INCREMENTAL_SPEEDUP_MIN = 4; // Phase F must beat full rebuild by ≥4×
 
 /**
  * Generate a Python project with N files. Each file imports the *previous*
@@ -96,8 +95,6 @@ describe.skipIf(!dockerAvailable)(
   () => {
     let projectRoot: string;
     let projectId: string;
-    let fullRebuildMs: number;
-
     beforeAll(async () => {
       await waitForQdrant();
       projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-scale-"));
@@ -118,7 +115,7 @@ describe.skipIf(!dockerAvailable)(
     it(`builds the symbol graph for ${N_FILES} files / ${TOTAL_SYMBOLS} symbols within budget`, async () => {
       const start = Date.now();
       await rebuildGraph(projectRoot);
-      fullRebuildMs = Date.now() - start;
+      const fullRebuildMs = Date.now() - start;
       // Log so the number shows up in test output even on success.
       console.log(`[scale] Full rebuild: ${N_FILES} files / ${TOTAL_SYMBOLS} symbols in ${fullRebuildMs} ms`);
       expect(fullRebuildMs).toBeLessThan(FULL_REBUILD_BUDGET_MS);
@@ -151,35 +148,23 @@ describe.skipIf(!dockerAvailable)(
       expect(impactMs).toBeLessThan(COLD_QUERY_BUDGET_MS);
     });
 
-    // retry: a wall-clock ratio on shared hardware can lose to a transient
-    // load spike (measured: a saturated box turns the 4x margin into 1.4x).
-    // A retry re-measures both sides under fresh conditions; a genuine
-    // Phase F regression fails every attempt.
-    it("Phase F incremental update is significantly faster than a full rebuild", { retry: 2 }, async () => {
-      // Re-measure the full rebuild HERE rather than reusing the timing from
-      // the earlier it block: the two blocks run minutes apart under
-      // different machine state (Qdrant warm-up, GC, background load), and
-      // comparing timings across that boundary flaked on unmodified runs.
-      // Both numbers in this assertion now come from the same block.
-      const fullStart = Date.now();
-      await rebuildGraph(projectRoot);
-      const freshFullRebuildMs = Date.now() - fullStart;
-
+    it("requests a safe full rebuild for a changed file before mutating graph storage", async () => {
       // Touch one file: append a new symbol.
       const rel = "pkg/mod_42.py";
       const abs = path.join(projectRoot, rel);
       const original = fs.readFileSync(abs, "utf-8");
+      const beforeMeta = await loadSymbolGraphMeta(projectId);
+      const beforeGeneration = beforeMeta?.generation;
+      expect(beforeGeneration).toBeDefined();
       fs.writeFileSync(
         abs,
         `${original}\ndef fn_42_${SYMBOLS_PER_FILE}_inc():\n    return -1\n`,
         "utf-8",
       );
       try {
-        // Build a fresh file-import graph (cheap part of Phase F) and time
-        // only the per-file symbol patch.
+        // Build only the file-import graph, then ask the compatibility guard
+        // whether a symbol-graph update may be applied in place.
         const graph = await rebuildGraph(projectRoot, { skipSymbolGraph: true });
-
-        const start = Date.now();
         const result = await updateChangedFilesSymbolGraph(
           projectId,
           projectRoot,
@@ -187,14 +172,22 @@ describe.skipIf(!dockerAvailable)(
           [rel],
           [],
         );
-        const incrementalMs = Date.now() - start;
-        console.log(`[scale] Phase F incremental update (1 file in ${N_FILES}-file repo): ${incrementalMs} ms (full rebuild was ${freshFullRebuildMs} ms)`);
-        expect(result.fullRebuildRequired).toBe(false);
-        expect(result.filesChanged).toBeGreaterThanOrEqual(1);
-        // Phase F's whole reason to exist: must beat full rebuild on a small
-        // change set by a wide margin. We allow 4× as a deliberately loose
-        // threshold to avoid CI flakiness.
-        expect(incrementalMs * INCREMENTAL_SPEEDUP_MIN).toBeLessThan(freshFullRebuildMs);
+        expect(result.fullRebuildRequired).toBe(true);
+
+        // The guard itself must leave the committed generation untouched.
+        const guardedMeta = await loadSymbolGraphMeta(projectId);
+        expect(guardedMeta?.generation).toBe(beforeGeneration);
+        const guardedCache = await getSymbolGraphCache(projectId);
+        const guardedPayload = await guardedCache?.getFilePayload(rel);
+        expect(guardedPayload?.symbols.some((symbol) => symbol.name.endsWith("_inc"))).toBe(false);
+
+        // The caller's full rebuild publishes the changed graph atomically.
+        await rebuildGraph(projectRoot);
+        const rebuiltMeta = await loadSymbolGraphMeta(projectId);
+        expect(rebuiltMeta?.generation).not.toBe(beforeGeneration);
+        const rebuiltCache = await getSymbolGraphCache(projectId);
+        const rebuiltPayload = await rebuiltCache?.getFilePayload(rel);
+        expect(rebuiltPayload?.symbols.some((symbol) => symbol.name === `fn_42_${SYMBOLS_PER_FILE}_inc`)).toBe(true);
       } finally {
         fs.writeFileSync(abs, original, "utf-8");
       }

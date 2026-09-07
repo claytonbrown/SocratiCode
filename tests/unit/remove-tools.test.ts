@@ -10,7 +10,7 @@
  * All external services are mocked — no Docker required.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ────────────────────────────────────────────────────────────────
 
@@ -48,6 +48,8 @@ vi.mock("../../src/services/indexer.js", () => ({
 const mockIsGraphBuildInProgress = vi.fn((_path: string) => false);
 const mockAwaitGraphBuild = vi.fn(async (_path: string) => {});
 const mockRemoveGraph = vi.fn(async (_path: string) => {});
+const mockGetExistingGraph = vi.fn(async () => null);
+const mockGetOrBuildGraph = vi.fn(async () => ({ nodes: [], edges: [] }));
 
 vi.mock("../../src/services/code-graph.js", () => ({
   isGraphBuildInProgress: (...args: unknown[]) => mockIsGraphBuildInProgress(...(args as [string])),
@@ -61,7 +63,8 @@ vi.mock("../../src/services/code-graph.js", () => ({
   getGraphStats: vi.fn(),
   getGraphStatus: vi.fn(async () => null),
   getLastGraphBuildCompleted: vi.fn(() => null),
-  getOrBuildGraph: vi.fn(async () => ({ nodes: [], edges: [] })),
+  getExistingGraph: (...args: unknown[]) => mockGetExistingGraph(...args),
+  getOrBuildGraph: (...args: unknown[]) => mockGetOrBuildGraph(...args),
   rebuildGraph: vi.fn(async () => ({ nodes: [], edges: [] })),
 }));
 
@@ -69,19 +72,24 @@ vi.mock("../../src/services/code-graph.js", () => ({
 
 const mockIsWatching = vi.fn((_path: string) => false);
 const mockStopWatching = vi.fn(async (_path: string) => {});
+const mockStartWatching = vi.fn(async () => true);
+const mockStartWatchingAutomatically = vi.fn(async () => true);
 
 vi.mock("../../src/services/watcher.js", () => ({
   isWatching: (...args: unknown[]) => mockIsWatching(...(args as [string])),
   stopWatching: (...args: unknown[]) => mockStopWatching(...(args as [string])),
-  startWatching: vi.fn(async () => true),
+  startWatching: (...args: unknown[]) => mockStartWatching(...args),
+  startWatchingAutomatically: (...args: unknown[]) => mockStartWatchingAutomatically(...args),
   getWatchedProjects: vi.fn(() => []),
   ensureWatcherStarted: vi.fn(),
 }));
 
 // ── docker.js mock ──────────────────────────────────────────────────────
 
+const mockEnsureQdrantReady = vi.fn(async () => ({ pulled: false, started: false }));
+
 vi.mock("../../src/services/docker.js", () => ({
-  ensureQdrantReady: vi.fn(async () => ({ pulled: false, started: false })),
+  ensureQdrantReady: (...args: unknown[]) => mockEnsureQdrantReady(...args),
   isDockerAvailable: vi.fn(async () => true),
 }));
 
@@ -94,6 +102,15 @@ vi.mock("../../src/services/embedding-config.js", () => ({
 vi.mock("../../src/services/embedding-provider.js", () => ({
   getEmbeddingProvider: vi.fn(async () => ({
     ensureReady: async () => ({ imagePulled: false, containerStarted: false, modelPulled: false }),
+  })),
+}));
+
+vi.mock("../../src/services/index-profile.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  ensureEffectiveEmbeddingReady: vi.fn(async () => ({
+    imagePulled: false,
+    containerStarted: false,
+    modelPulled: false,
   })),
 }));
 
@@ -124,6 +141,9 @@ vi.mock("../../src/services/context-artifacts.js", () => ({
 vi.mock("../../src/services/qdrant.js", () => ({
   getCollectionInfo: vi.fn(async () => null),
   loadContextMetadata: vi.fn(async () => null),
+  loadEffectiveIndexProfileForCollection: vi.fn(async () => ({
+    embedding: { provider: "ollama", model: "test", dimensions: 3 },
+  })),
 }));
 
 // ── ollama.js mock ──────────────────────────────────────────────────────
@@ -136,6 +156,7 @@ vi.mock("../../src/services/ollama.js", () => ({
 
 vi.mock("../../src/config.js", () => ({
   projectIdFromPath: vi.fn(() => "test-project-id"),
+  collectionName: vi.fn(() => "codebase_test-project-id"),
   contextCollectionName: vi.fn(() => "context_test"),
 }));
 
@@ -155,6 +176,76 @@ import { handleIndexTool } from "../../src/tools/index-tools.js";
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const TEST_PATH = "/tmp/test-project";
+
+describe("manual indexing mode", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.SOCRATICODE_WATCHER;
+  });
+
+  afterEach(() => {
+    delete process.env.SOCRATICODE_WATCHER;
+  });
+
+  it("rejects codebase_watch start in off mode before infrastructure or catch-up work", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+
+    const result = await handleIndexTool("codebase_watch", {
+      projectPath: TEST_PATH,
+      action: "start",
+    });
+
+    expect(result).toContain("File watcher disabled by SOCRATICODE_WATCHER=off");
+    expect(mockEnsureQdrantReady).not.toHaveBeenCalled();
+    expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
+    expect(mockStartWatching).not.toHaveBeenCalled();
+  });
+
+  it("does not lazily build a missing graph in manual mode", async () => {
+    process.env.SOCRATICODE_WATCHER = "manual";
+    mockGetExistingGraph.mockResolvedValueOnce(null);
+
+    const result = await handleGraphTool("codebase_graph_stats", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(result).toContain("Automatic graph creation is disabled");
+    expect(result).toContain("codebase_graph_build");
+    expect(mockGetExistingGraph).toHaveBeenCalledWith(TEST_PATH);
+    expect(mockGetOrBuildGraph).not.toHaveBeenCalled();
+  });
+
+  it("preserves lazy graph creation in the default mode", async () => {
+    await handleGraphTool("codebase_graph_stats", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(mockGetOrBuildGraph).toHaveBeenCalledWith(TEST_PATH);
+    expect(mockGetExistingGraph).not.toHaveBeenCalled();
+  });
+
+  it("preserves post-update automatic watcher startup in the default mode", async () => {
+    const result = await handleIndexTool("codebase_update", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(result).toContain("Updated project index");
+    expect(mockStartWatchingAutomatically).toHaveBeenCalledWith(TEST_PATH);
+    expect(mockStartWatching).not.toHaveBeenCalled();
+  });
+
+  it("preserves post-index automatic watcher startup in the default mode", async () => {
+    const result = await handleIndexTool("codebase_index", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(result).toContain("Indexing started in the background");
+    await vi.waitFor(() => {
+      expect(mockStartWatchingAutomatically).toHaveBeenCalledWith(TEST_PATH);
+    });
+    expect(mockStartWatching).not.toHaveBeenCalled();
+  });
+});
 
 describe("codebase_remove — stops all in-flight operations before deleting", () => {
   beforeEach(() => {

@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-/**
- * Unit tests for the ensureOllamaReady conditional guard in query-tools.ts.
- * Verifies that codebase_search only calls ensureOllamaReady() for the Ollama
- * provider, and uses getEmbeddingProvider() for OpenAI/Google.
- */
+/** Unit tests for query-tool routing and result formatting. */
 
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ────────────────────────────────────────────────────────────────
 
@@ -21,41 +17,6 @@ vi.mock("../../src/services/logger.js", () => ({
   },
 }));
 
-// ── embedding-config.js mock ─────────────────────────────────────────────
-
-const mockGetEmbeddingConfig = vi.fn(() => ({
-  embeddingProvider: "ollama" as string,
-  embeddingModel: "test-model",
-}));
-
-vi.mock("../../src/services/embedding-config.js", () => ({
-  getEmbeddingConfig: (...args: unknown[]) => mockGetEmbeddingConfig(...(args as [])),
-}));
-
-// ── embedding-provider.js mock ───────────────────────────────────────────
-
-const mockGetEmbeddingProvider = vi.fn(async () => ({
-  embed: vi.fn(),
-  ensureReady: vi.fn(async () => ({ imagePulled: false, containerStarted: false, modelPulled: false })),
-  health: vi.fn(),
-}));
-
-vi.mock("../../src/services/embedding-provider.js", () => ({
-  getEmbeddingProvider: (...args: unknown[]) => mockGetEmbeddingProvider(...(args as [])),
-}));
-
-// ── ollama.js mock ───────────────────────────────────────────────────────
-
-const mockEnsureOllamaReady = vi.fn(async () => ({
-  modelPulled: false,
-  containerStarted: false,
-  imagePulled: false,
-}));
-
-vi.mock("../../src/services/ollama.js", () => ({
-  ensureOllamaReady: (...args: unknown[]) => mockEnsureOllamaReady(...(args as [])),
-}));
-
 // ── docker.js mock ───────────────────────────────────────────────────────
 
 vi.mock("../../src/services/docker.js", () => ({
@@ -65,16 +26,26 @@ vi.mock("../../src/services/docker.js", () => ({
 
 // ── qdrant.js mock ───────────────────────────────────────────────────────
 
+import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
 import type { SearchResult } from "../../src/types.js";
 
 const mockSearchChunks = vi.fn(async (_collection: string, _query: string, _limit: number): Promise<SearchResult[]> => []);
 const mockSearchMultipleCollections = vi.fn(async (): Promise<SearchResult[]> => []);
+const mockGetCollectionInfo = vi.fn(async (): Promise<{
+  pointsCount: number;
+  status: string;
+  denseVectorSize?: number;
+} | null> => ({ pointsCount: 0, status: "green" }));
+const mockGetProjectMetadata = vi.fn(async () => null);
+const mockLoadProjectEffectiveProfile = vi.fn(async (): Promise<EffectiveIndexProfile | null> => null);
 
 vi.mock("../../src/services/qdrant.js", () => ({
   searchChunks: (...args: unknown[]) => mockSearchChunks(...(args as [string, string, number])),
   searchMultipleCollections: (...args: unknown[]) => mockSearchMultipleCollections(...(args as [])),
-  getCollectionInfo: vi.fn(async () => ({ points_count: 0 })),
-  getProjectMetadata: vi.fn(async () => null),
+  getCollectionInfo: (...args: unknown[]) => mockGetCollectionInfo(...(args as [string])),
+  getProjectMetadata: (...args: unknown[]) => mockGetProjectMetadata(...(args as [string])),
+  loadProjectEffectiveProfile: (...args: unknown[]) =>
+    mockLoadProjectEffectiveProfile(...(args as [string])),
 }));
 
 // ── config.js mock ───────────────────────────────────────────────────────
@@ -102,6 +73,7 @@ vi.mock("../../src/services/indexer.js", () => ({
 
 vi.mock("../../src/services/code-graph.js", () => ({
   getGraphStatus: vi.fn(async () => null),
+  isGraphBuilderStale: vi.fn(() => false),
 }));
 
 // ── context-artifacts.js mock ───────────────────────────────────────────
@@ -112,10 +84,14 @@ vi.mock("../../src/services/context-artifacts.js", () => ({
 
 // ── watcher.js mock ──────────────────────────────────────────────────────
 
+const mockEnsureWatcherStarted = vi.fn();
+const mockIsWatching = vi.fn(() => false);
+const mockIsWatchedByAnyProcess = vi.fn(async () => false);
+
 vi.mock("../../src/services/watcher.js", () => ({
-  ensureWatcherStarted: vi.fn(),
-  isWatching: vi.fn(() => false),
-  isWatchedByAnyProcess: vi.fn(async () => false),
+  ensureWatcherStarted: (...args: unknown[]) => mockEnsureWatcherStarted(...args),
+  isWatching: (...args: unknown[]) => mockIsWatching(...args),
+  isWatchedByAnyProcess: (...args: unknown[]) => mockIsWatchedByAnyProcess(...args),
 }));
 
 // ── lock.js mock ─────────────────────────────────────────────────────────
@@ -133,60 +109,167 @@ vi.mock("../../src/constants.js", async (importOriginal) => {
 
 // ── Imports (after mocks) ────────────────────────────────────────────────
 
+import { ensureQdrantReady } from "../../src/services/docker.js";
 import { handleQueryTool } from "../../src/tools/query-tools.js";
+
+const mockEnsureQdrantReady = vi.mocked(ensureQdrantReady);
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const TEST_PATH = "/tmp/test-project";
+const SEARCH_RESULT: SearchResult = {
+  filePath: "/tmp/test-project/src/index.ts",
+  relativePath: "src/index.ts",
+  content: "export const value = 1;",
+  startLine: 1,
+  endLine: 1,
+  language: "typescript",
+  score: 0.5,
+};
 
-describe("codebase_search — embedding provider readiness guard", () => {
+afterEach(() => {
+  delete process.env.SOCRATICODE_WATCHER;
+  mockIsWatching.mockReturnValue(false);
+  mockIsWatchedByAnyProcess.mockResolvedValue(false);
+});
+
+describe("manual indexing watcher status", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 3, status: "green" });
+    mockGetProjectMetadata.mockResolvedValue(null);
+    mockLoadProjectEffectiveProfile.mockResolvedValue(null);
   });
 
-  it("calls ensureOllamaReady when embeddingProvider is ollama", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "ollama",
-      embeddingModel: "test-model",
-    });
+  it("labels search results as a deliberate snapshot when watching is off", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+    mockSearchChunks.mockResolvedValueOnce([SEARCH_RESULT]);
 
-    await handleQueryTool("codebase_search", {
+    const output = await handleQueryTool("codebase_search", {
       projectPath: TEST_PATH,
-      query: "test query",
+      query: "value",
     });
 
-    expect(mockEnsureOllamaReady).toHaveBeenCalledOnce();
-    expect(mockGetEmbeddingProvider).not.toHaveBeenCalled();
+    expect(output).toContain("INDEX SNAPSHOT");
+    expect(output).toContain("last explicit codebase_index or codebase_update");
   });
 
-  it("calls getEmbeddingProvider (not ensureOllamaReady) when embeddingProvider is openai", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "openai",
-      embeddingModel: "text-embedding-3-small",
-    });
+  it("labels an empty search as a deliberate snapshot when watching is off", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+    mockSearchChunks.mockResolvedValueOnce([]);
 
-    await handleQueryTool("codebase_search", {
+    const output = await handleQueryTool("codebase_search", {
       projectPath: TEST_PATH,
-      query: "test query",
+      query: "missing",
     });
 
-    expect(mockEnsureOllamaReady).not.toHaveBeenCalled();
-    expect(mockGetEmbeddingProvider).toHaveBeenCalledOnce();
+    expect(output).toContain("No results found");
+    expect(output).toContain("INDEX SNAPSHOT");
+    expect(output).toContain("last explicit codebase_index or codebase_update");
   });
 
-  it("calls getEmbeddingProvider (not ensureOllamaReady) when embeddingProvider is google", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "google",
-      embeddingModel: "gemini-embedding-001",
-    });
+  it("labels below-threshold search results as a manual snapshot", async () => {
+    process.env.SOCRATICODE_WATCHER = "manual";
+    mockSearchChunks.mockResolvedValueOnce([{ ...SEARCH_RESULT, score: 0.01 }]);
 
-    await handleQueryTool("codebase_search", {
+    const output = await handleQueryTool("codebase_search", {
       projectPath: TEST_PATH,
-      query: "test query",
+      query: "weak match",
+      minScore: 0.5,
     });
 
-    expect(mockEnsureOllamaReady).not.toHaveBeenCalled();
-    expect(mockGetEmbeddingProvider).toHaveBeenCalledOnce();
+    expect(output).toContain("No results above score threshold");
+    expect(output).toContain("INDEX SNAPSHOT");
+    expect(output).toContain("SOCRATICODE_WATCHER=manual");
+  });
+
+  it("does not tell agents to auto-start the watcher in manual mode", async () => {
+    process.env.SOCRATICODE_WATCHER = "manual";
+    mockSearchChunks.mockResolvedValueOnce([SEARCH_RESULT]);
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+    });
+
+    expect(output).toContain("SOCRATICODE_WATCHER=manual");
+    expect(output).toContain("Run codebase_update to refresh");
+    expect(output).not.toContain("being started automatically");
+  });
+
+  it("warns when another process can still update an off-mode shared index", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+    mockSearchChunks.mockResolvedValueOnce([SEARCH_RESULT]);
+    mockIsWatchedByAnyProcess.mockResolvedValueOnce(true);
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+    });
+
+    expect(output).toContain("another active watcher");
+    expect(output).toContain("for every MCP process");
+  });
+
+  it("requires a restart when this process still watches after switching to off", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+    mockSearchChunks.mockResolvedValueOnce([SEARCH_RESULT]);
+    mockIsWatching.mockReturnValueOnce(true);
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+    });
+
+    expect(output).toContain("this process still has an active watcher");
+    expect(output).toContain("Restart the MCP server");
+    expect(output).not.toContain("another active watcher");
+  });
+
+  it("reports off as disabled rather than inactive", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+
+    const output = await handleQueryTool("codebase_status", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(output).toContain("File watcher: disabled (SOCRATICODE_WATCHER=off)");
+    expect(output).not.toContain("File watcher: inactive");
+  });
+
+  it("reports manual mode with the explicit actions that can refresh it", async () => {
+    process.env.SOCRATICODE_WATCHER = "manual";
+
+    const output = await handleQueryTool("codebase_status", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(output).toContain("File watcher: inactive (SOCRATICODE_WATCHER=manual");
+    expect(output).toContain("codebase_update to refresh");
+  });
+
+  it("reports off mode when Qdrant is unavailable", async () => {
+    process.env.SOCRATICODE_WATCHER = "off";
+    mockEnsureQdrantReady.mockRejectedValueOnce(new Error("Qdrant unavailable"));
+
+    const output = await handleQueryTool("codebase_status", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(output).toContain("Qdrant is not available");
+    expect(output).toContain("File watcher: disabled (SOCRATICODE_WATCHER=off)");
+  });
+
+  it("reports manual mode when the project has no index", async () => {
+    process.env.SOCRATICODE_WATCHER = "manual";
+    mockGetCollectionInfo.mockResolvedValueOnce(null);
+
+    const output = await handleQueryTool("codebase_status", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(output).toContain("No index found for project");
+    expect(output).toContain("File watcher: inactive (SOCRATICODE_WATCHER=manual");
   });
 });
 
@@ -195,11 +278,6 @@ describe("codebase_search — embedding provider readiness guard", () => {
 describe("codebase_search — includeLinked parameter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Default: ollama provider
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "ollama",
-      embeddingModel: "test-model",
-    });
   });
 
   it("calls searchChunks (not searchMultipleCollections) when includeLinked is omitted", async () => {
@@ -305,5 +383,27 @@ describe("codebase_search — includeLinked parameter", () => {
     // Should have the file but no project tag brackets
     expect(output).toContain("src/index.ts");
     expect(output).not.toMatch(/\[[^\]]+\]\s*src\//); // no [project-name] tag before file path
+  });
+});
+
+describe("codebase_status: effective profile", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 3, status: "green" });
+    mockGetProjectMetadata.mockResolvedValue(null);
+  });
+
+  it("resolves an unprofiled legacy index without writing during status", async () => {
+    mockLoadProjectEffectiveProfile.mockResolvedValue(null);
+
+    const output = await handleQueryTool("codebase_status", {
+      projectPath: TEST_PATH,
+    });
+
+    expect(output).toContain("Status: green");
+    expect(output).toContain("requested change");
+    expect(output).toContain("indexFormatVersion");
+    expect(output).toContain("legacy-unverified fields");
+    expect(output).toContain("embedding.provider");
   });
 });

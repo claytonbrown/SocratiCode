@@ -191,7 +191,7 @@ export class LiteLLMEmbeddingProvider implements EmbeddingProvider {
     logger.info("LiteLLM embedding provider ready", {
       baseUrl: config.litellmUrl,
       model: config.embeddingModel,
-      sendDimensions: shouldSendDimensions(),
+      sendDimensions: config.litellmSendDimensions,
     });
     // LiteLLM is user-managed — no containers, no model pulls.
     return { modelPulled: false, containerStarted: false, imagePulled: false };
@@ -299,18 +299,9 @@ export class LiteLLMEmbeddingProvider implements EmbeddingProvider {
       model,
       input: texts,
       encoding_format: "float",
-      ...(shouldSendDimensions() ? { dimensions } : {}),
+      ...(getEmbeddingConfig().litellmSendDimensions ? { dimensions } : {}),
     });
     const sorted = response.data.sort((a, b) => a.index - b.index);
     return sorted.map((d) => d.embedding);
   }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-function shouldSendDimensions(): boolean {
-  const raw = process.env.LITELLM_SEND_DIMENSIONS;
-  if (!raw) return false;
-  const v = raw.toLowerCase();
-  return v === "true" || v === "1" || v === "yes";
 }

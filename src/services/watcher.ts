@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { AsyncSubscription, Event } from "@parcel/watcher";
@@ -7,17 +8,32 @@ import watcher from "@parcel/watcher";
 import { collectionName, projectIdFromPath } from "../config.js";
 import {
   EXTENSION_LANGUAGE_MAP,
+  getWatcherMode,
   indexExtensionlessEnabled,
   SPECIAL_FILES,
   SUPPORTED_EXTENSIONS,
 } from "../constants.js";
 import { invalidateGraphCache } from "./code-graph.js";
 import { detectExtensionFromSource, readFileHead } from "./extensionless.js";
-import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import {
+  createIgnoreFilter,
+  type IgnoreFilter,
+  isEnvironmentDirectory,
+  isEnvironmentMarker,
+  shouldIgnore,
+} from "./ignore.js";
+import {
+  profileExtensionLanguageMap,
+  resolveEffectiveIndexProfile,
+} from "./index-profile.js";
 import { FILE_SCAN_BATCH, isIndexingInProgress, updateProjectIndex } from "./indexer.js";
 import { acquireProjectLock, isProjectLocked, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
-import { getCollectionInfo, getProjectMetadata } from "./qdrant.js";
+import {
+  getCollectionInfo,
+  getProjectMetadata,
+  loadProjectEffectiveProfile,
+} from "./qdrant.js";
 
 /** Active subscriptions per project path */
 const subscriptions = new Map<string, AsyncSubscription>();
@@ -48,13 +64,16 @@ const EXTERNAL_WATCH_CACHE_TTL_MS = 60_000;
  * unreadable path returns `true` so the change is still reconciled, while a
  * directory/FIFO/other non-regular file returns `false` (never head-read).
  */
-export async function isIndexableFile(filePath: string): Promise<boolean> {
+export async function isIndexableFile(
+  filePath: string,
+  extensionLanguageMap: Map<string, string> = EXTENSION_LANGUAGE_MAP,
+): Promise<boolean> {
   const fileName = path.basename(filePath);
   if (SPECIAL_FILES.has(fileName)) return true;
   const ext = path.extname(filePath).toLowerCase();
-  // EXTENSION_LANGUAGE_MAP extensions are real source files, so edits to them
+  // Effective extension-map entries are real source files, so edits to them
   // must trigger an incremental update like any other supported file.
-  if (SUPPORTED_EXTENSIONS.has(ext) || EXTENSION_LANGUAGE_MAP.has(ext)) return true;
+  if (SUPPORTED_EXTENSIONS.has(ext) || extensionLanguageMap.has(ext)) return true;
   if (ext !== "" || !indexExtensionlessEnabled()) return false;
   // Extensionless: only a regular file can be a code file. @parcel/watcher also
   // emits events for directories/FIFOs/sockets, which must NOT be head-read — a
@@ -90,6 +109,79 @@ export async function isIndexableFile(filePath: string): Promise<boolean> {
       });
     }
     return true;
+  }
+}
+
+/**
+ * What this event says about an environment: that one has appeared or vanished
+ * (`"changed"` — the ignore filter's answer for the tree is now wrong), that it
+ * is about an environment but agrees with what the filter already says
+ * (`"touches"`), or that it is an ordinary event (`null`).
+ *
+ * Three shapes reach here, because the native watcher reports them
+ * differently. A marker written or deleted in place (`env/pyvenv.cfg`,
+ * `env/conda-meta/history`) is an event on the marker. An environment moved
+ * away (`mv env env.old`) is one event on the directory, `delete env`, and
+ * nothing on the marker inside it — FSEvents and inotify both report the
+ * renamed directory only — so a directory the filter knows as an environment
+ * root counts too. And one moved into place is one `create` on a directory the
+ * filter has never heard of, which is asked for its marker on disk.
+ *
+ * Agreement between the filter and the disk is `"touches"`, and on its own it
+ * schedules nothing: a marker present in a directory already excluded, or gone
+ * from one never excluded, changes nothing, and dropping it is what keeps
+ * `conda install` — which rewrites `conda-meta/` on every run — from
+ * reconciling the whole tree (review finding). It is told apart from an
+ * ordinary event all the same, because agreement is only trustworthy while the
+ * filter describes the tree: see the caller, where an update is running.
+ *
+ * Every created path is asked whether it is a directory, before anything is
+ * read off its name: a directory may carry a dot — `backend/venv.3.12` moved
+ * into place is one `create` on it and nothing else — and a first cut that
+ * skipped the stat for a path with an extension dropped exactly that event
+ * (review finding). One `lstat` per created path is the price, in a callback
+ * that already stats every extensionless one.
+ */
+export function environmentEvent(
+  event: Event,
+  relative: string,
+  ig: IgnoreFilter,
+): "changed" | "touches" | null {
+  if (isEnvironmentMarker(relative) || ig.isEnvironmentRoot(relative)) {
+    const excluded = shouldIgnore(ig, relative);
+    return excluded !== isEnvironmentDirectory(environmentRootOf(event.path, relative))
+      ? "changed"
+      : "touches";
+  }
+  if (event.type !== "create") return null;
+  if (lstatOrNull(event.path)?.isDirectory() !== true || !isEnvironmentDirectory(event.path)) {
+    return null;
+  }
+  return shouldIgnore(ig, `${relative}/`) ? "touches" : "changed";
+}
+
+/** Resolve a marker event back to the environment directory it describes. */
+function environmentRootOf(eventPath: string, relative: string): string {
+  const segments = relative.split(path.sep).join("/").split("/");
+  const condaMetaIndex = segments.indexOf("conda-meta");
+  if (condaMetaIndex !== -1) {
+    let root = eventPath;
+    for (let i = condaMetaIndex; i < segments.length; i++) root = path.dirname(root);
+    return root;
+  }
+  return segments[segments.length - 1] === "pyvenv.cfg" ? path.dirname(eventPath) : eventPath;
+}
+
+/**
+ * Synchronous on purpose: the question is asked of a handful of paths per
+ * batch, and an answer that arrives through the event loop is one the debounce
+ * cannot be made to wait for.
+ */
+function lstatOrNull(filePath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(filePath, { throwIfNoEntry: false }) ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -141,6 +233,13 @@ export async function startWatching(
 ): Promise<boolean> {
   const resolvedPath = path.resolve(projectPath);
 
+  if (getWatcherMode() === "off") {
+    const message = "File watcher disabled by SOCRATICODE_WATCHER=off";
+    onProgress?.(message);
+    logger.info(message, { projectPath: resolvedPath });
+    return false;
+  }
+
   if (subscriptions.has(resolvedPath)) {
     onProgress?.(`Already watching ${resolvedPath}`);
     return true;
@@ -154,50 +253,93 @@ export async function startWatching(
     return false;
   }
 
-  const ig = createIgnoreFilter(resolvedPath);
+  // Replaceable, not built once: the filter's rules are read off the tree —
+  // nested .gitignore files, and the markers a Python or conda environment is
+  // recognised by — and the tree changes under a watcher. It is rebuilt after
+  // each successful update, so the events that follow are judged by what the
+  // tree holds now; a marker appearing or vanishing is let through to schedule
+  // that update in the first place (see the event filter below).
+  let ig = createIgnoreFilter(resolvedPath);
   const ignoreGlobs = buildIgnoreGlobs();
+
+  // While an update runs, `ig` is the state the tree had when it started, and
+  // an environment event arriving in that window cannot be judged against it.
+  // Remember every update request instead of starting a competing update: the
+  // index lock makes that competing call a no-op, and it could otherwise clear
+  // the environment event that requires reconciliation. Exactly one update is
+  // scheduled after the active one finishes (review finding).
+  let watcherActive = true;
+  let updateRunning = false;
+  let updateRequestedWhileRunning = false;
 
   // Reset error count
   watcherErrorCounts.set(resolvedPath, 0);
 
-  const scheduleUpdate = () => {
-    const existing = debounceTimers.get(resolvedPath);
-    if (existing) clearTimeout(existing);
-
-    debounceTimers.set(
-      resolvedPath,
-      setTimeout(async () => {
-        debounceTimers.delete(resolvedPath);
-        try {
-          onProgress?.(`Detected changes, updating index for ${resolvedPath}...`);
-
-          // Invalidate the code graph cache so it will be rebuilt
-          invalidateGraphCache(resolvedPath);
-
-          const result = await updateProjectIndex(resolvedPath, onProgress);
-          onProgress?.(
-            `Auto-update: ${result.added} added, ${result.updated} updated, ${result.removed} removed`,
-          );
-
-          // Note: code graph rebuild is now handled inside updateProjectIndex itself
-        } catch (err) {
-          // Graceful degradation: log but don't crash the watcher
-          const message = err instanceof Error ? err.message : String(err);
-          logger.error("Watch auto-update failed", { projectPath: resolvedPath, error: message });
-          onProgress?.(`Auto-update failed (will retry on next change): ${message}`);
-
-          // If Qdrant is unreachable, don't spam retries — back off
-          if (message.includes("ECONNREFUSED") || message.includes("fetch failed") || message.includes("Request Timeout")) {
-            logger.warn("Infrastructure appears down, pausing watcher updates for 30s", { projectPath: resolvedPath });
-            await new Promise((resolve) => setTimeout(resolve, 30_000));
-          }
-        }
-      }, DEBOUNCE_MS),
-    );
-  };
+  let extensionLanguageMap: Map<string, string> | null = null;
 
   try {
-    const subscription = await watcher.subscribe(
+    const scheduleUpdate = () => {
+      if (!watcherActive) return;
+      if (updateRunning) {
+        updateRequestedWhileRunning = true;
+        return;
+      }
+
+      const existing = debounceTimers.get(resolvedPath);
+      if (existing) clearTimeout(existing);
+
+      debounceTimers.set(
+        resolvedPath,
+        setTimeout(async () => {
+          debounceTimers.delete(resolvedPath);
+          // stopWatching invalidates this closure before awaiting the native
+          // unsubscribe, so a timer already queued cannot start work while
+          // that asynchronous shutdown is still pending.
+          if (!watcherActive) return;
+          updateRunning = true;
+          try {
+            onProgress?.(`Detected changes, updating index for ${resolvedPath}...`);
+
+            // Invalidate the code graph cache so it will be rebuilt
+            invalidateGraphCache(resolvedPath);
+
+            const result = await updateProjectIndex(resolvedPath, onProgress);
+            onProgress?.(
+              `Auto-update: ${result.added} added, ${result.updated} updated, ${result.removed} removed`,
+            );
+
+            // The update read the tree as it is now; the filter should too. An
+            // environment created since the last build is excluded from here
+            // on, and one removed stops hiding the source files in its place.
+            ig = createIgnoreFilter(resolvedPath);
+
+            // Note: code graph rebuild is now handled inside updateProjectIndex itself
+          } catch (err) {
+            // Graceful degradation: log but don't crash the watcher
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error("Watch auto-update failed", { projectPath: resolvedPath, error: message });
+            onProgress?.(`Auto-update failed (will retry on next change): ${message}`);
+
+            // If Qdrant is unreachable, do not spam retries; back off.
+            if (message.includes("ECONNREFUSED") || message.includes("fetch failed") || message.includes("Request Timeout")) {
+              logger.warn("Infrastructure appears down, pausing watcher updates for 30s", { projectPath: resolvedPath });
+              await new Promise((resolve) => setTimeout(resolve, 30_000));
+            }
+          } finally {
+            updateRunning = false;
+            // One follow-up for all requests received during this update. It
+            // runs after a failed update too, where the changes are likewise
+            // unreconciled.
+            if (updateRequestedWhileRunning) {
+              updateRequestedWhileRunning = false;
+              scheduleUpdate();
+            }
+          }
+        }, DEBOUNCE_MS),
+      );
+    };
+
+    const nativeSubscription = await watcher.subscribe(
       resolvedPath,
       async (err: Error | null, events: Event[]) => {
         if (err) {
@@ -234,6 +376,36 @@ export async function startWatching(
         // crashing the process or silently dropping the batch. Guard the whole
         // body, mirroring the scheduleUpdate debounce ("log but don't crash").
         try {
+          if (extensionLanguageMap === null) {
+            try {
+              const collection = collectionName(projectIdFromPath(resolvedPath));
+              const collectionInfo = await getCollectionInfo(collection);
+              const storedProfile = collectionInfo === null
+                ? null
+                : await loadProjectEffectiveProfile(collection);
+              extensionLanguageMap = profileExtensionLanguageMap(
+                resolveEffectiveIndexProfile(
+                  "code",
+                  storedProfile,
+                  (collectionInfo?.pointsCount ?? 0) > 0,
+                  collectionInfo?.denseVectorSize,
+                ),
+              );
+            } catch (profileErr) {
+              // Do not substitute the requested extension map for an existing
+              // collection. Schedule the canonical update, which resolves the
+              // effective profile before scanning or writing, and retry this
+              // profile read on the next event batch.
+              logger.warn("Watch profile load failed; scheduling profile-aware update", {
+                projectPath: resolvedPath,
+                error: profileErr instanceof Error ? profileErr.message : String(profileErr),
+              });
+              scheduleUpdate();
+              return;
+            }
+          }
+          const effectiveExtensionLanguageMap = extensionLanguageMap;
+
           // Batch the (async, fd-opening) indexability checks like every other
           // scan path (FILE_SCAN_BATCH), so a bulk change coalesced into one
           // callback can't open hundreds of files at once and hit EMFILE.
@@ -245,8 +417,25 @@ export async function startWatching(
                 // never triggers the async head-read (matches getIndexableFiles).
                 const relative = path.relative(resolvedPath, event.path);
                 if (!relative || relative.startsWith("..")) return null;
+                // An environment appearing or vanishing changes what the
+                // filter should answer, and the reconciliation it schedules is
+                // what removes a new environment's files from the index, or
+                // brings back the source files of a directory that has stopped
+                // being one. Neither event passes the checks below on its own
+                // — a marker is not indexable, and once the environment exists
+                // its directory is excluded — so they are recognised first.
+                const environment = environmentEvent(event, relative, ig);
+                if (environment !== null && updateRunning) {
+                  // `ig` describes the tree the running update started from, so
+                  // neither answer can be trusted here — including "nothing
+                  // changed". Remembered, and reconciled once when that update
+                  // ends.
+                  updateRequestedWhileRunning = true;
+                  return null;
+                }
+                if (environment === "changed") return event;
                 if (shouldIgnore(ig, relative)) return null;
-                if (await isIndexableFile(event.path)) return event;
+                if (await isIndexableFile(event.path, effectiveExtensionLanguageMap)) return event;
                 // A previously-indexed extensionless file edited into readable
                 // non-code (detection now → null) is no longer "indexable", but
                 // its stale chunks/symbols must still be reconciled. Let
@@ -285,6 +474,16 @@ export async function startWatching(
       },
     );
 
+    const subscription: AsyncSubscription = {
+      unsubscribe: async () => {
+        // Invalidate this closure before awaiting the native unsubscribe. An
+        // active update may finish during that await and must not schedule a
+        // deferred reconciliation after the watcher has stopped.
+        watcherActive = false;
+        await nativeSubscription.unsubscribe();
+      },
+    };
+
     subscriptions.set(resolvedPath, subscription);
     externalWatchCache.delete(resolvedPath);
     onProgress?.(`Started watching ${resolvedPath}`);
@@ -298,6 +497,19 @@ export async function startWatching(
     onProgress?.(`Failed to start watching ${resolvedPath}: ${message}`);
     return false;
   }
+}
+
+/**
+ * Start a watcher only when automatic watching is enabled. Manual mode keeps
+ * startWatching available to an explicit codebase_watch start request, while
+ * off mode is also enforced inside startWatching as a final safety boundary.
+ */
+export async function startWatchingAutomatically(
+  projectPath: string,
+  onProgress?: (message: string) => void,
+): Promise<boolean> {
+  if (getWatcherMode() !== "auto") return false;
+  return startWatching(projectPath, onProgress);
 }
 
 /** Stop watching a project directory */
@@ -369,6 +581,10 @@ export function clearExternalWatchCache(): void {
  */
 export function ensureWatcherStarted(projectPath: string): void {
   const resolvedPath = path.resolve(projectPath);
+
+  // Manual and off modes must not touch Qdrant, acquire the watch lock, or
+  // create a native subscription in response to an unrelated tool call.
+  if (getWatcherMode() !== "auto") return;
 
   // Already watching in this process — nothing to do
   if (subscriptions.has(resolvedPath)) return;

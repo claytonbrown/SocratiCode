@@ -97,6 +97,9 @@ describe("indexer utilities", () => {
       expect(isIndexableFile("theme.styl")).toBe(true);
       expect(isIndexableFile("data.json")).toBe(true);
       expect(isIndexableFile("readme.md")).toBe(true);
+      expect(isIndexableFile("player.gd")).toBe(true);
+      expect(isIndexableFile("level.tscn")).toBe(true);
+      expect(isIndexableFile("material.tres")).toBe(true);
     });
 
     it("accepts special filenames", () => {

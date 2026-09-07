@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ensureQdrantReady } from "../../src/services/docker.js";
+import {
+  requestedIndexProfile,
+} from "../../src/services/index-profile.js";
 import { ensureOllamaReady } from "../../src/services/ollama.js";
 import {
   deleteCollection,
@@ -18,7 +21,11 @@ import {
 } from "../../src/services/qdrant.js";
 import type { FileChunk } from "../../src/types.js";
 import { isDockerAvailable } from "../helpers/fixtures.js";
-import { deleteTestCollection, waitForOllama, waitForQdrant } from "../helpers/setup.js";
+import {
+  deleteTestCollection,
+  waitForOllama,
+  waitForQdrant,
+} from "../helpers/setup.js";
 
 const dockerAvailable = isDockerAvailable();
 const TEST_COLLECTION = "codebase_test_qdrant_integration";
@@ -45,6 +52,9 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
 
       expect(info).toBeDefined();
       expect(info?.status).toBe("green");
+      expect(info?.denseVectorSize).toBe(
+        requestedIndexProfile("code").embedding.dimensions,
+      );
     });
 
     it("is idempotent — creating an existing collection does not error", async () => {
@@ -108,7 +118,12 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
     const _embeddings: number[][] = [];
 
     it("upserts chunks with real embeddings (generated internally)", async () => {
-      await upsertChunks(TEST_COLLECTION, chunks, "test-content-hash");
+      await upsertChunks(
+        TEST_COLLECTION,
+        chunks,
+        "test-content-hash",
+        requestedIndexProfile("code"),
+      );
 
       // Verify points were created
       const info = await getCollectionInfo(TEST_COLLECTION);
@@ -224,13 +239,22 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
         ["src/math.ts", "hash-math"],
       ]);
 
-      await saveProjectMetadata(metadataCollection, projectPath, 42, 2, fileHashes, "completed");
+      await saveProjectMetadata(
+        metadataCollection,
+        projectPath,
+        42,
+        2,
+        fileHashes,
+        "completed",
+        requestedIndexProfile("code"),
+      );
 
       const metadata = await getProjectMetadata(metadataCollection);
       expect(metadata).toBeDefined();
       expect(metadata?.projectPath).toBe(projectPath);
       expect(metadata?.filesTotal).toBe(42);
       expect(metadata?.filesIndexed).toBe(2);
+      expect(metadata?.effectiveProfile).toEqual(requestedIndexProfile("code"));
     });
 
     it("loads project hashes", async () => {

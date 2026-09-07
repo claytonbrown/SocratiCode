@@ -1,8 +1,8 @@
 {
   "name": "socraticode",
   "displayName": "SocratiCode",
-  "description": "Codebase context engine for AI assistants. Hybrid search, dependency and call graphs, symbol-level impact analysis (blast radius), interactive graph explorer, and searchable architecture artefacts. Works with Copilot agent mode, Cline, Continue, Roo Code, and any MCP-compatible host.",
-  "version": "1.12.0",
+  "description": "Codebase context engine for VS Code's native MCP host. Hybrid search, dependency and call graphs, symbol-level impact analysis, interactive graph explorer, and searchable architecture artefacts.",
+  "version": "1.13.0",
   "publisher": "giancarloerra",
   "license": "AGPL-3.0-only",
   "icon": "images/icon.png",
@@ -12,7 +12,7 @@
   },
   "engines": {
     "vscode": "^1.99.0",
-    "node": ">=18.0.0"
+    "node": ">=18.17.0"
   },
   "categories": [
     "AI",
@@ -81,7 +81,7 @@
     "viewsWelcome": [
       {
         "view": "socraticode.projects",
-        "contents": "SocratiCode indexes your codebase so AI assistants can search, trace dependencies and run impact analysis on it.\n\n[Index this workspace](command:socraticode.indexCurrentWorkspace)\n\nAsk your AI assistant (Copilot agent mode, Cline, Continue, Roo Code) to call any SocratiCode tool. The MCP server registers automatically on activation.\n\n[Open the getting-started walkthrough](command:socraticode.openWalkthrough)\n\n[Read the docs](https://github.com/giancarloerra/socraticode#readme)"
+        "contents": "SocratiCode indexes your codebase so AI assistants can search, trace dependencies and run impact analysis on it.\n\n[Index this workspace](command:socraticode.indexCurrentWorkspace)\n\nAsk your editor's native agent to call a SocratiCode tool. The MCP server registers with the editor's native MCP registry on activation. Independent clients require their own MCP configuration; see the host-specific integration guidance.\n\n[Open the getting-started walkthrough](command:socraticode.openWalkthrough)\n\n[Read the docs](https://github.com/giancarloerra/socraticode#readme)"
       }
     ],
     "commands": [
@@ -132,14 +132,15 @@
         "socraticode.command": {
           "type": "string",
           "default": "npx",
-          "description": "Command used to launch the engine. Defaults to `npx -y socraticode`. Override only if you have a custom install.",
+          "description": "Command used to launch the engine. Defaults to `npx -y --prefer-online socraticode@latest`. Override only if you have a custom install.",
           "scope": "window"
         },
         "socraticode.args": {
           "type": "array",
           "default": [
             "-y",
-            "socraticode"
+            "--prefer-online",
+            "socraticode@latest"
           ],
           "items": {
             "type": "string"

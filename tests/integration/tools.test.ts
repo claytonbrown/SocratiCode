@@ -363,15 +363,35 @@ describe.skipIf(!dockerAvailable)(
         expect(result).toContain("Missing required argument");
       });
 
-      it("returns a blast-radius report for a known symbol", async () => {
+      it("returns a blast-radius report for a known function symbol", async () => {
         const result = await handleGraphTool("codebase_impact", {
           projectPath: fixture.root,
-          target: "main",
+          target: "greet",
           depth: 3,
         });
         expect(typeof result).toBe("string");
-        // Either "Blast radius for ..." (found) or graceful empty/no-graph message.
-        expect(result.length).toBeGreaterThan(0);
+        expect(result).toContain("Blast radius for symbol: greet");
+        expect(result).toContain("src/index.ts");
+      });
+
+      it("returns a blast-radius report for an interface export (issue #132)", async () => {
+        const result = await handleGraphTool("codebase_impact", {
+          projectPath: fixture.root,
+          target: "UserConfig",
+          depth: 3,
+        });
+        expect(typeof result).toBe("string");
+        expect(result).toContain("Blast radius for symbol: UserConfig");
+        expect(result).toContain("src/index.ts");
+      });
+
+      it("returns informative not found error for non-existent symbol", async () => {
+        const result = await handleGraphTool("codebase_impact", {
+          projectPath: fixture.root,
+          target: "NonExistentSymbolXYZ",
+          depth: 3,
+        });
+        expect(result).toContain("not found");
       });
     });
 

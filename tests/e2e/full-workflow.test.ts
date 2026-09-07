@@ -34,6 +34,7 @@ import {
   type FixtureProject,
   isDockerAvailable,
 } from "../helpers/fixtures.js";
+import { fullIndexOperationState } from "../helpers/index-status.js";
 import {
   cleanupTestCollections,
   waitForOllama,
@@ -51,12 +52,10 @@ async function waitForIndexingComplete(
     const status = await handleQueryTool("codebase_status", {
       projectPath,
     });
-    if (
-      status.includes("Last completed") ||
-      status.includes("chunks") ||
-      (status.includes("files") && status.includes("indexed"))
-    ) {
-      return;
+    const operationState = fullIndexOperationState(status);
+    if (operationState === "completed") return;
+    if (operationState === "failed") {
+      throw new Error(`Full indexing failed:\n${status}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 3_000));
   }

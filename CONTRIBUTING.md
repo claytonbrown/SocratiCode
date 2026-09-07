@@ -10,7 +10,7 @@ By submitting a pull request, you agree to the [Contributor License Agreement (C
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 18.17 or newer
 - Docker (for integration and E2E tests)
 - Git
 

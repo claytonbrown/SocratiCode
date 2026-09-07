@@ -11,10 +11,13 @@ import {
   buildGoModuleInfo,
   buildJvmSuffixMap,
   buildPythonManifests,
+  buildRustCrateMap,
   hasLiteralShellPathShape,
   type PythonManifest,
   pythonRootsForFile,
+  type RustCrate,
   resolveImport,
+  resolveRustImport,
 } from "../../src/services/graph-resolution.js";
 
 // ── Helper to create temp project layouts ─────────────────────────────
@@ -1345,6 +1348,1173 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBeNull();
+    });
+
+    // ── Crate map ──────────────────────────────────────────────────────
+
+    /** Lay out a project and read its crates the way buildCodeGraph does. */
+    let fileSet = new Set<string>();
+    const rustProject = (files: Record<string, string>): RustCrate[] => {
+      project = createTempProject(files);
+      fileSet = project.fileSet;
+      return buildRustCrateMap(fileSet, project.root);
+    };
+
+    it("records a crate under the name Cargo lets others import it by", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "my-app-core"\nedition = "2021"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates).toEqual([
+        {
+          dir: ".",
+          name: "my_app_core",
+          packageName: "my_app_core",
+          libRoot: "src/lib.rs",
+          roots: ["src/lib.rs"],
+          edition: "2021",
+        },
+      ]);
+    });
+
+    it("keeps the package name beside a library name that differs from it", () => {
+      // A dependency on this crate is declared under the package name; the
+      // code that uses it writes the library name. Both are needed to tell
+      // whether an import names a crate the importing package declared.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "rust-crypto"\n\n[lib]\nname = "crypto"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].name).toBe("crypto");
+      expect(crates[0].packageName).toBe("rust_crypto");
+      expect(crates[0].manifestUnread).toBeUndefined();
+    });
+
+    it("inherits the edition a workspace declares for its members", () => {
+      // `edition.workspace = true` is a table, not a string, so reading the
+      // key as a plain string dropped the member to 2015 — and 2015 turns
+      // autodiscovery off next to a declared `[[bin]]`, so `due.rs` stopped
+      // being a crate root at all. Cargo 1.70, 1.85 and 1.98 all keep it.
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml":
+          '[package]\nname = "app"\nedition.workspace = true\n\n[[bin]]\nname = "uno"\npath = "src/bin/uno.rs"\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/uno.rs": "",
+        "app/src/bin/due.rs": "",
+      });
+
+      const member = crates.find((crate) => crate.dir === "app");
+      expect(member?.edition).toBe("2021");
+      expect(member?.roots).toContain("app/src/bin/due.rs");
+    });
+
+    it("keeps a member that asks for no edition on the 2015 rules", () => {
+      // The other hand of the test above: inheritance happens only when the
+      // member spells it out. With the key absent, Cargo reads 2015 — and
+      // then the declared `[[bin]]` does turn autodiscovery off, which is
+      // what makes the assertion above mean something.
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml":
+          '[package]\nname = "app"\n\n[[bin]]\nname = "uno"\npath = "src/bin/uno.rs"\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/uno.rs": "",
+        "app/src/bin/due.rs": "",
+      });
+
+      const member = crates.find((crate) => crate.dir === "app");
+      expect(member?.edition).toBe("2015");
+      expect(member?.roots).not.toContain("app/src/bin/due.rs");
+    });
+
+    it("keeps a member's own edition over the one the workspace declares", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "app/src/lib.rs": "",
+      });
+
+      expect(crates.find((crate) => crate.dir === "app")?.edition).toBe("2015");
+    });
+
+    it("takes the library path a manifest declares over the conventional one", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "odd"\n\n[lib]\npath = "lib/entry.rs"\n',
+        "lib/entry.rs": "",
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].libRoot).toBe("lib/entry.rs");
+    });
+
+    it("takes the library name over the package name", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "the-package"\n\n[lib]\nname = "the_lib"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].name).toBe("the_lib");
+    });
+
+    it("gives no importable name to a crate with no library", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "just-a-binary"\n',
+        "src/main.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({ name: null, libRoot: null, roots: ["src/main.rs"] });
+    });
+
+    it("records every target as a root of its own module tree", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "many"\nedition = "2021"\n\n[[bin]]\nname = "declared"\npath = "extra/tool.rs"\n',
+        "src/lib.rs": "",
+        "src/main.rs": "",
+        "src/bin/one.rs": "",
+        "src/bin/two/main.rs": "",
+        "src/bin/two/helper.rs": "",
+        "extra/tool.rs": "",
+        "tests/it.rs": "",
+        "examples/demo.rs": "",
+        "benches/bench.rs": "",
+        "build.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual([
+        "benches/bench.rs",
+        "build.rs",
+        "examples/demo.rs",
+        "extra/tool.rs",
+        "src/bin/one.rs",
+        "src/bin/two/main.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "tests/it.rs",
+      ]);
+    });
+
+    it("stops discovering binaries when a 2015 manifest declares one by hand", () => {
+      // Same tree as above with the edition key removed, which is what a 2015
+      // manifest looks like. `cargo metadata` on it reports six targets, not
+      // nine: declaring a `[[bin]]` by hand turns off the autodiscovery of the
+      // rest in that edition, and `src/main.rs` is one of the rest.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "many"\n\n[[bin]]\nname = "declared"\npath = "extra/tool.rs"\n',
+        "src/lib.rs": "",
+        "src/main.rs": "",
+        "src/bin/one.rs": "",
+        "src/bin/two/main.rs": "",
+        "extra/tool.rs": "",
+        "tests/it.rs": "",
+        "examples/demo.rs": "",
+        "benches/bench.rs": "",
+        "build.rs": "",
+      });
+
+      expect(crates[0].edition).toBe("2015");
+      expect(crates[0].roots).toEqual([
+        "benches/bench.rs",
+        "build.rs",
+        "examples/demo.rs",
+        "extra/tool.rs",
+        "src/lib.rs",
+        "tests/it.rs",
+      ]);
+    });
+
+    it("keeps a malformed manifest's conventional targets and gives it no name", () => {
+      const crates = rustProject({
+        "Cargo.toml": "[package\nname = ",
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({ name: null, roots: ["src/lib.rs"] });
+    });
+
+    it("ignores the manifests Cargo unpacks under target/", () => {
+      const crates = rustProject({
+        // DEFAULT_IGNORE_PATTERNS lists `target`, so only a negation reaches
+        // the unconditional skip — and a negation is all it takes for every
+        // vendored dependency to register as a crate of this project.
+        ".socraticodeignore": "!target/\n",
+        "Cargo.toml": '[package]\nname = "real"\n',
+        "src/lib.rs": "",
+        "target/package/vendored-0.1.0/Cargo.toml": '[package]\nname = "vendored"\n',
+        "target/package/vendored-0.1.0/src/lib.rs": "",
+      });
+
+      expect(crates.map((c) => c.name)).toEqual(["real"]);
+    });
+
+    // ── Module paths ───────────────────────────────────────────────────
+
+    it("resolves crate:: against the crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/db/pool.rs": "",
+        "src/db/mod.rs": "",
+      });
+
+      expect(resolveRustImport("crate::db::pool", "src/lib.rs", fileSet, crates))
+        .toBe("src/db/pool.rs");
+    });
+
+    it("stops at the deepest path segment that names a file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/db.rs": "",
+      });
+
+      // `Connection` is a type inside db.rs, not a module below it.
+      expect(resolveRustImport("crate::db::Connection", "src/lib.rs", fileSet, crates))
+        .toBe("src/db.rs");
+    });
+
+    it("resolves a path naming only root items to the root module", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/other.rs": "",
+      });
+
+      expect(resolveRustImport("crate::Error", "src/other.rs", fileSet, crates))
+        .toBe("src/lib.rs");
+    });
+
+    it("resolves super:: to the parent module's sibling", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/api/routes.rs": "",
+        "src/api/state.rs": "",
+      });
+
+      expect(resolveRustImport("super::state::State", "src/api/routes.rs", fileSet, crates))
+        .toBe("src/api/state.rs");
+    });
+
+    it("climbs one module per super", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/a/b/c.rs": "",
+        "src/a/shared.rs": "",
+      });
+
+      expect(resolveRustImport("super::super::shared", "src/a/b/c.rs", fileSet, crates))
+        .toBe("src/a/shared.rs");
+    });
+
+    it("does not let super:: climb out of the crate", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/thing.rs": "",
+        // Beside the crate's src/, so an unchecked second climb lands on it.
+        "crates/app/outside.rs": "",
+      });
+
+      // `thing` sits directly under the crate root, so `super` is already the
+      // root and a second climb would leave the module tree entirely.
+      expect(resolveRustImport("super::super::outside", "crates/app/src/thing.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("does not draw an edge from a module file to itself", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/a/mod.rs": "",
+      });
+
+      // `use super::a::Thing;` inside `mod tests` in a/mod.rs walks back down
+      // to the file it started from.
+      expect(resolveRustImport("super::a::Thing", "src/a/mod.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("resolves self:: to a submodule of the importing file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/parser.rs": "",
+        "src/parser/lexer.rs": "",
+      });
+
+      expect(resolveRustImport("self::lexer::Token", "src/parser.rs", fileSet, crates))
+        .toBe("src/parser/lexer.rs");
+    });
+
+    it("resolves a sibling crate by the name Cargo gives it", () => {
+      const crates = rustProject({
+        "Cargo.toml": "[workspace]\nmembers = [\"crates/cli\", \"crates/core\"]\n",
+        // Declared, as rustc requires: a sibling the manifest never names is
+        // not in the extern prelude, whatever the workspace holds.
+        "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\n\n[dependencies]\napp-core = { path = "../core" }\n',
+        "crates/cli/src/main.rs": "",
+        "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/core/src/config.rs": "",
+      });
+
+      expect(resolveRustImport("app_core::config::Config", "crates/cli/src/main.rs", fileSet, crates))
+        .toBe("crates/core/src/config.rs");
+    });
+
+    it("does not reach a sibling crate the importing package never declared", () => {
+      // Review finding. Only what a package declares is in its extern prelude:
+      // `use helper::Thing` in a package whose manifest names no `helper` is
+      // E0432 to rustc, yet the raw name used to be searched across every crate
+      // of the workspace and drew an edge into the sibling. Declared under
+      // another name, the alias is what the code writes; the package's own
+      // library is the one name reached without declaring it.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "helper", "util"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[dependencies]\nutil = { path = "../util" }\ntools = { path = "../helper", package = "helper" }\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/tool.rs": "",
+        "helper/Cargo.toml": '[package]\nname = "helper"\n',
+        "helper/src/lib.rs": "",
+        "util/Cargo.toml": '[package]\nname = "util"\n',
+        "util/src/lib.rs": "",
+        // `util` declares nothing, so `helper` is out of its reach too.
+      });
+
+      expect(resolveRustImport("helper::Thing", "app/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("helper::Thing", "util/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("tools::Thing", "app/src/lib.rs", fileSet, crates)).toBe("helper/src/lib.rs");
+      expect(resolveRustImport("util::Thing", "app/src/lib.rs", fileSet, crates)).toBe("util/src/lib.rs");
+      expect(resolveRustImport("app::run", "app/src/bin/tool.rs", fileSet, crates)).toBe("app/src/lib.rs");
+    });
+
+    it("admits a declared dependency by the library name its code is imported under", () => {
+      // Review finding on the fence's first cut. A dependency is declared
+      // under its package name, and the code writes its library name: `other`
+      // in the manifest, `otherlib` in the `use`, wherever `[lib] name` is
+      // set — `rust-crypto` is imported as `crypto`. Keyed on the declared
+      // names alone, the fence turned that edge away, a regression against the
+      // head before it. Renamed, the alias is the only name in scope: with
+      // `dep = { package = "other" }` the code writes `dep`, and `otherlib`
+      // is E0432.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "renamer", "other"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[dependencies]\nother = { path = "../other" }\n',
+        "app/src/lib.rs": "",
+        "renamer/Cargo.toml": '[package]\nname = "renamer"\n\n[dependencies]\ndep = { path = "../other", package = "other" }\n',
+        "renamer/src/lib.rs": "",
+        "other/Cargo.toml": '[package]\nname = "other"\n\n[lib]\nname = "otherlib"\n',
+        "other/src/lib.rs": "",
+        "other/src/deep.rs": "",
+      });
+
+      expect(resolveRustImport("otherlib::deep::Thing", "app/src/lib.rs", fileSet, crates)).toBe("other/src/deep.rs");
+      expect(resolveRustImport("other::Thing", "app/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("dep::deep::Thing", "renamer/src/lib.rs", fileSet, crates)).toBe("other/src/deep.rs");
+      expect(resolveRustImport("otherlib::Thing", "renamer/src/lib.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("does not fence a package whose manifest could not be read", () => {
+      // Review finding. An unparseable `Cargo.toml` declares nothing that can
+      // be known, and reading that as "declares nothing" cost the package every
+      // cross-crate edge — where the map's own promise is that one unreadable
+      // manifest must not cost the project its Rust edges.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[[[broken\n',
+        "app/src/lib.rs": "",
+        "util/Cargo.toml": '[package]\nname = "util"\n',
+        "util/src/lib.rs": "",
+      });
+
+      expect(crates.find((c) => c.dir === "app")?.manifestUnread).toBe(true);
+      expect(resolveRustImport("util::Thing", "app/src/lib.rs", fileSet, crates)).toBe("util/src/lib.rs");
+    });
+
+    it("leaves a third-party crate unresolved", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/models.rs": "",
+      });
+
+      expect(resolveRustImport("serde::Deserialize", "src/lib.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("resolves a uniform path to a module in scope", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/store.rs": "",
+      });
+
+      // `mod store;` beside `pub use store::Store;` — the 2018 spelling that
+      // omits `self::`, which is how a crate republishes its own modules.
+      expect(resolveRustImport("store::Store", "src/lib.rs", fileSet, crates))
+        .toBe("src/store.rs");
+    });
+
+    it("resolves super:: to the parent module's own file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/store.rs": "",
+        "src/store/open.rs": "",
+      });
+
+      // The parent of `store::open` is `store`, which lives in store.rs beside
+      // the directory — the layout rustc recommends over store/mod.rs.
+      expect(resolveRustImport("super::Store", "src/store/open.rs", fileSet, crates))
+        .toBe("src/store.rs");
+    });
+
+
+    it("resolves a mod declaration into the declaring file's own directory", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/parser.rs": "",
+        "src/parser/lexer.rs": "",
+        "src/lexer.rs": "",
+      });
+
+      // `mod lexer;` inside src/parser.rs is src/parser/lexer.rs — the file
+      // beside parser.rs is a different module with the same name.
+      expect(resolveRustImport("lexer", "src/parser.rs", fileSet, crates))
+        .toBe("src/parser/lexer.rs");
+    });
+
+    it("resolves a mod declaration in a crate root beside it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/config.rs": "",
+      });
+
+      expect(resolveRustImport("config", "src/lib.rs", fileSet, crates))
+        .toBe("src/config.rs");
+    });
+
+    it("treats a binary under src/bin as its own crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/helper.rs": "",
+        "src/bin/tool.rs": "",
+        "src/bin/helper.rs": "",
+      });
+
+      // The binary's module tree starts in src/bin, so its `crate::helper` is
+      // src/bin/helper.rs and not the library's src/helper.rs.
+      expect(resolveRustImport("crate::helper", "src/bin/tool.rs", fileSet, crates))
+        .toBe("src/bin/helper.rs");
+    });
+
+    it("does not let a root's directory capture a file whose name merely begins with it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/helper.rs": "",
+        "src/bin/tool.rs": "",
+        "src/bindings.rs": "",
+      });
+
+      // `src/bindings.rs` belongs to the library. Its path begins with the
+      // string "src/bin", but not with the directory "src/bin/" — comparing
+      // the prefix without the separator hands the file the binary's root,
+      // and `crate::helper` then looks for `src/bin/helper.rs`, which is not
+      // the file the library declares. The guard is one character wide, so
+      // nothing else in the suite fails when it is removed.
+      expect(resolveRustImport("crate::helper", "src/bindings.rs", fileSet, crates))
+        .toBe("src/helper.rs");
+    });
+
+    it("prefers the crate whose directory holds the importing file", () => {
+      const crates = rustProject({
+        "workspace-a/Cargo.toml": '[package]\nname = "shared"\n',
+        "workspace-a/src/lib.rs": "",
+        "workspace-a/src/thing.rs": "",
+        "workspace-b/Cargo.toml": '[package]\nname = "shared"\n',
+        "workspace-b/src/lib.rs": "",
+        "workspace-b/src/thing.rs": "",
+        "workspace-b/src/user.rs": "",
+      });
+
+      expect(resolveRustImport("shared::thing", "workspace-b/src/user.rs", fileSet, crates))
+        .toBe("workspace-b/src/thing.rs");
+    });
+
+    it("resolves mod, self and super with no manifest in the tree", () => {
+      project = createTempProject({
+        "src/lib.rs": "",
+        "src/api.rs": "",
+        "src/api/routes.rs": "",
+        "src/api/state.rs": "",
+      });
+
+      expect(resolveRustImport("routes", "src/api.rs", project.fileSet, []))
+        .toBe("src/api/routes.rs");
+      expect(resolveRustImport("super::state", "src/api/routes.rs", project.fileSet, []))
+        .toBe("src/api/state.rs");
+      expect(resolveRustImport("crate::api::state", "src/api/routes.rs", project.fileSet, []))
+        .toBeNull();
+    });
+
+    it("resolves through resolveImport with the crate map passed in", () => {
+      project = createTempProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/config.rs": "",
+      });
+      const crates = buildRustCrateMap(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "crate::config::Config",
+        path.join(project.root, "src/lib.rs"),
+        project.root,
+        project.fileSet,
+        "rust",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        crates,
+      );
+
+      expect(result).toBe("src/config.rs");
+    });
+
+    it("disables target autodiscovery when autobins, autotests, autoexamples, or autobenches is false", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "spenta"\nautobins = false\nautotests = false\nautoexamples = false\nautobenches = false\n',
+        "src/lib.rs": "",
+        "src/bin/tool.rs": "",
+        "tests/integration.rs": "",
+        "examples/demo.rs": "",
+        "benches/bench.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual(["src/lib.rs"]);
+    });
+
+    it("disables library autodiscovery when autolib is false", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "no-lib"\nautolib = false\n',
+        "src/lib.rs": "",
+        "src/main.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({
+        name: null,
+        libRoot: null,
+        roots: ["src/main.rs"],
+      });
+    });
+
+    it("does not register build.rs when package build is false", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "no-build"\nbuild = false\n',
+        "src/lib.rs": "",
+        "build.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual(["src/lib.rs"]);
+    });
+
+    it("finds a target declared by name alone at the path Cargo gives that name", () => {
+      // `[[bin]] name = "tool"` with no `path` is resolved by convention from
+      // the name: src/bin/tool.rs, tests/cli.rs, examples/demo.rs,
+      // benches/speed.rs. Edition 2015 is what makes this test able to fail —
+      // there the declarations turn autodiscovery off, so the name is the only
+      // route left to those files. `cargo metadata` reports exactly these five
+      // targets for this manifest on 1.70.0, 1.85.0 and 1.98.0.
+      const crates = rustProject({
+        "Cargo.toml": [
+          '[package]',
+          'name = "app"',
+          'edition = "2015"',
+          '',
+          '[[bin]]',
+          'name = "tool"',
+          '',
+          '[[test]]',
+          'name = "cli"',
+          '',
+          '[[example]]',
+          'name = "demo"',
+          '',
+          '[[bench]]',
+          'name = "speed"',
+          '',
+        ].join("\n"),
+        "src/lib.rs": "",
+        "src/bin/tool.rs": "",
+        "tests/cli.rs": "",
+        "examples/demo.rs": "",
+        "benches/speed.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual([
+        "benches/speed.rs",
+        "examples/demo.rs",
+        "src/bin/tool.rs",
+        "src/lib.rs",
+        "tests/cli.rs",
+      ]);
+    });
+
+    it("shuts off autodiscovery for declared target types in edition 2015 but keeps it in 2018+", () => {
+      const crates2015 = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "e2015"\nedition = "2015"\n\n[[bin]]\nname = "explicit"\npath = "custom/tool.rs"\n',
+        "src/lib.rs": "",
+        "custom/tool.rs": "",
+        "src/bin/other.rs": "",
+      });
+      // In 2015, manual [[bin]] turns off autobins by default
+      expect(crates2015[0].roots).toEqual(["custom/tool.rs", "src/lib.rs"]);
+
+      const crates2018 = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "e2018"\nedition = "2018"\n\n[[bin]]\nname = "explicit"\npath = "custom/tool.rs"\n',
+        "src/lib.rs": "",
+        "custom/tool.rs": "",
+        "src/bin/other.rs": "",
+      });
+      // In 2018+, manual [[bin]] leaves autodiscovery on
+      expect(crates2018[0].roots).toEqual(["custom/tool.rs", "src/bin/other.rs", "src/lib.rs"]);
+    });
+
+    it("keeps a member under [workspace] exclude importable by name", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/ignored", "crates/fixtures/*"]\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\n\n[dependencies]\nignored-crate = { path = "../ignored" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/ignored/Cargo.toml": '[package]\nname = "ignored-crate"\n',
+        "crates/ignored/src/lib.rs": "",
+        "crates/fixtures/demo/Cargo.toml": '[package]\nname = "demo-fixture"\n',
+        "crates/fixtures/demo/src/lib.rs": "",
+        "standalone/Cargo.toml": '[package]\nname = "standalone"\n',
+        "standalone/src/lib.rs": "",
+      });
+
+      // `exclude` keeps a member out of the default set of workspace-wide
+      // commands; it says nothing about who may depend on it. A member can
+      // and does depend on an excluded package by path — built and compiled
+      // to check — so reading `exclude` as "not importable" loses that edge.
+      expect(crates.find((c) => c.dir === "crates/app")?.name).toBe("app");
+      expect(crates.find((c) => c.dir === "crates/ignored")?.name).toBe("ignored_crate");
+      expect(crates.find((c) => c.dir === "crates/fixtures/demo")?.name).toBe("demo_fixture");
+      expect(crates.find((c) => c.dir === "standalone")?.name).toBe("standalone");
+    });
+
+    it("records renamed dependency aliases in crate aliases map", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/*"]\n',
+        "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\n\n[dependencies]\nmy_alias = { package = "app-core", path = "../core" }\n',
+        "crates/app/src/lib.rs": "",
+      });
+
+      const appCrate = crates.find((c) => c.dir === "crates/app");
+      expect(appCrate?.aliases).toEqual({
+        my_alias: "app_core",
+      });
+    });
+
+    it("resolves workspace dependency aliases defined in [workspace.dependencies]", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["crates/*"]\n\n[workspace.dependencies]\nshared-alias = { package = "actual-core", path = "crates/core" }\n',
+        "crates/core/Cargo.toml": '[package]\nname = "actual-core"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\n\n[dependencies]\nshared-alias = { workspace = true }\n',
+        "crates/app/src/lib.rs": "",
+      });
+
+      const appCrate = crates.find((c) => c.dir === "crates/app");
+      expect(appCrate?.aliases).toEqual({
+        shared_alias: "actual_core",
+      });
+    });
+
+    it("skips custom build directories marked with CACHEDIR.TAG or .cargo-ok", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "my-app"\n',
+        "src/lib.rs": "",
+        "custom-target/CACHEDIR.TAG": "Signature: 8a477f597d28d172783f06886806bc55\n",
+        "custom-target/vendored/Cargo.toml": '[package]\nname = "vendored"\n',
+        "custom-target/vendored/src/lib.rs": "",
+      });
+
+      expect(crates.map((c) => c.name)).toEqual(["my_app"]);
+    });
+
+    it("correctly resolves the benchmark workspace with disabled autodiscovery and excluded member", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["membri/*"]\nexclude = ["membri/fuori"]\n',
+        "membri/app/Cargo.toml": '[package]\nname = "app"\n',
+        "membri/app/src/lib.rs": "",
+        "membri/spenta/Cargo.toml":
+          '[package]\nname = "spenta"\nautobins = false\nautotests = false\nautoexamples = false\n',
+        "membri/spenta/src/lib.rs": "",
+        "membri/spenta/src/bin/ignorato.rs": "",
+        "membri/spenta/tests/ignorato.rs": "",
+        "membri/spenta/examples/ignorato.rs": "",
+        "membri/fuori/Cargo.toml": '[package]\nname = "fuori-dal-giro"\n',
+        "membri/fuori/src/lib.rs": "",
+      });
+
+      const appCrate = crates.find((c) => c.dir === "membri/app");
+      const spentaCrate = crates.find((c) => c.dir === "membri/spenta");
+      const fuoriCrate = crates.find((c) => c.dir === "membri/fuori");
+
+      expect(appCrate?.name).toBe("app");
+      expect(appCrate?.roots).toEqual(["membri/app/src/lib.rs"]);
+
+      expect(spentaCrate?.name).toBe("spenta");
+      expect(spentaCrate?.roots).toEqual(["membri/spenta/src/lib.rs"]);
+
+      expect(fuoriCrate?.name).toBe("fuori_dal_giro");
+      expect(fuoriCrate?.roots).toEqual(["membri/fuori/src/lib.rs"]);
+    });
+
+    // ── Paths the conventions do not reach ─────────────────────────────
+
+    it("takes the file of a mod from the path its attribute declares", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/area.rs": "",
+        "src/elsewhere/moved.rs": "",
+      });
+
+      // The attribute is relative to the directory the declaring file sits in,
+      // never to the directory that file's own submodules live in.
+      expect(resolveRustImport("elsewhere/moved.rs", "src/area.rs", fileSet, crates))
+        .toBe("src/elsewhere/moved.rs");
+      expect(resolveRustImport("elsewhere/moved.rs", "src/lib.rs", fileSet, crates))
+        .toBe("src/elsewhere/moved.rs");
+      expect(resolveRustImport("nowhere/absent.rs", "src/lib.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("counts a path attribute inside an inline module from the module directory", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/area.rs": "",
+        "src/block/moved.rs": "",
+        "src/area/block/moved.rs": "",
+      });
+
+      // From the crate root the module directory is `src`; from `src/area.rs`
+      // it is `src/area`. Both then take one directory per inline level.
+      expect(resolveRustImport("self/block/moved.rs", "src/lib.rs", fileSet, crates))
+        .toBe("src/block/moved.rs");
+      expect(resolveRustImport("self/block/moved.rs", "src/area.rs", fileSet, crates))
+        .toBe("src/area/block/moved.rs");
+    });
+
+    it("leaves an unanchored 2015 path unresolved, a declared limit", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/registry.rs": "",
+        "src/client.rs": "",
+      });
+
+      // `use registry::write;` in `src/client.rs` does compile in 2015 when
+      // `mod registry;` is written in `lib.rs`, and names `src/registry.rs`.
+      // The edge is left undrawn on purpose: acting on the root-relative
+      // reading means answering a path with no declaration behind it, and every
+      // attempt to bound that drew an edge rustc rejects — a bare `use b;`
+      // between two integration-test crates, an undeclared sibling file, a
+      // `mod` declared in a nested block, a virtual workspace's root crate
+      // claiming its members' declarations. `main` drew nothing here either.
+      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("reads an unanchored path from the file's own module directory, never the crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        // The crate root's `registry`, which is what the 2015 reading would
+        // reach and this one must not.
+        "src/registry.rs": "",
+        "src/client.rs": "",
+        "src/client/registry.rs": "",
+      });
+
+      // `src/client.rs` owns `src/client/`, so the head is read from there and
+      // the crate root's `registry` is not it. The rule holds in every
+      // edition — the 2015 case above is the same walk with nothing to find.
+      // Review finding: this asserted `null` on a fixture without
+      // `src/client/registry.rs`, which is also what the 2015 case answers, so
+      // it passed on the absence of a file and proved nothing. Its name said
+      // "from edition 2018 on", a distinction the resolver stopped making when
+      // the declaration gate was turned on for every edition.
+      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBe(
+        "src/client/registry.rs",
+      );
+    });
+
+    it("lets a local module win over a sibling crate of the same name", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // rustc consults the extern prelude last, so a module in scope wins. The
+      // other order drew an edge into an unrelated crate whenever a local
+      // module carried a published crate's name.
+      expect(resolveRustImport("config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/app/src/config.rs");
+    });
+
+    it("keeps a leading :: out of the local modules", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // Without the marker this is the same path as `config::Settings`, which
+      // the local module answers — and the leading `::` is written precisely
+      // to say it should not.
+      expect(resolveRustImport("::config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/config/src/lib.rs");
+    });
+
+    it("reads a leading :: as the crate root in edition 2015", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // The same specifier, one edition earlier, means the opposite thing:
+      // there is no extern prelude to point at, and `::` is the crate root an
+      // unanchored path already counts from. Checked on 1.98.0, where a crate
+      // with `pub mod log;` and `use ::log::LocalMarker;` compiles under 2015
+      // and is E0432 under 2018.
+      expect(resolveRustImport("::config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/app/src/config.rs");
+    });
+
+    it("answers a 2015 leading :: from the crate root, not from the child's own declarations", () => {
+      // Review finding, left open from an earlier round. `src/deep/child.rs`
+      // declares `#[path = "local.rs"] mod foo;` of its own, and the root
+      // declares `mod foo;` too. `use ::foo::Item` written in the child names
+      // the root's — `::` is the crate root in 2015 — yet the child's
+      // declaration map was consulted first and answered with `local.rs`.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "src/lib.rs": "",
+        "src/foo.rs": "",
+        "src/deep/mod.rs": "",
+        "src/deep/child.rs": "",
+        "src/deep/local.rs": "",
+      });
+      const childDeclares = new Map([["foo", "local.rs"]]);
+
+      expect(resolveRustImport("::foo::Item", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/foo.rs");
+      expect(resolveRustImport("::foo", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/foo.rs");
+      // Without the marker the child's own `foo` is the one in scope.
+      expect(resolveRustImport("foo::Item", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/deep/local.rs");
+    });
+
+    it("answers a 2015 leading :: with a declared crate when the root has no such module", () => {
+      // Review finding on the branch's first cut: the walk from the root fell
+      // back on the root file whenever nothing matched, so the crate lookup
+      // after it never ran — a declared sibling lost its edge to the
+      // importer's own `lib.rs`, and a registry crate gained one. In 2015
+      // `extern crate foo;` at the root puts the crate at the root; the
+      // sibling resolves, the registry crate resolves to nothing, and a name
+      // rustc provides on its own — `core` — is not an item of this crate.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["old", "foo"]\n',
+        "old/Cargo.toml": '[package]\nname = "old"\nedition = "2015"\n\n[dependencies]\nfoo = { path = "../foo" }\ncfg-if = "1"\n',
+        "old/src/lib.rs": "",
+        "old/src/bar.rs": "",
+        "old/src/deep/mod.rs": "",
+        "old/src/deep/child.rs": "",
+        "old/tests/it.rs": "",
+        "foo/Cargo.toml": '[package]\nname = "foo"\n',
+        "foo/src/lib.rs": "",
+        "foo/src/item.rs": "",
+      });
+
+      expect(resolveRustImport("::foo::item::Item", "old/src/deep/child.rs", fileSet, crates)).toBe("foo/src/item.rs");
+      expect(resolveRustImport("::foo", "old/src/deep/child.rs", fileSet, crates)).toBe("foo/src/lib.rs");
+      expect(resolveRustImport("::cfg_if::cfg_if", "old/src/deep/child.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("::core::fmt", "old/src/deep/child.rs", fileSet, crates)).toBeNull();
+      // A module of the root still wins, and an item of the root is the root.
+      expect(resolveRustImport("::bar::BarItem", "old/src/deep/child.rs", fileSet, crates)).toBe("old/src/bar.rs");
+      expect(resolveRustImport("::RootItem", "old/src/deep/child.rs", fileSet, crates)).toBe("old/src/lib.rs");
+      // An integration test reaches the library by its crate name.
+      expect(resolveRustImport("::old::bar::BarItem", "old/tests/it.rs", fileSet, crates)).toBe("old/src/bar.rs");
+    });
+
+    it("leaves a 2015 leading :: unresolved when no target root covers the file", () => {
+      // A file outside every Cargo target has no root to count from, and a
+      // guess would be an edge rustc never draws. `foo` is declared, so the
+      // fence is not what answers here: it is the missing root.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "foo"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n\n[dependencies]\nfoo = { path = "../foo" }\n',
+        "app/src/lib.rs": "",
+        "app/scratch/loose.rs": "",
+        "foo/Cargo.toml": '[package]\nname = "foo"\n',
+        "foo/src/lib.rs": "",
+      });
+
+      expect(resolveRustImport("::foo::Item", "app/scratch/loose.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("lets an unanchored path reach a module the file declares, and only then", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
+        "src/lib.rs": "",
+        "src/serde.rs": "",
+      });
+
+      // Both hands in one place, which is what the graph-level assertion
+      // cannot do: there the `mod serde;` declaration draws the same edge, so
+      // the edge stays whatever the unanchored path resolves to.
+      expect(
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Map([["serde", "serde"]])),
+      ).toBe("src/serde.rs");
+      expect(
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Map()),
+      ).toBeNull();
+    });
+
+    it("reaches a module the attribute moved, and its children beside that file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/foo"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/custom.rs": "",
+        "crates/app/src/inner.rs": "",
+        // A library carrying the module's name, which is what the path used to
+        // land on once the name alone found no file.
+        "crates/foo/Cargo.toml": '[package]\nname = "foo"\nedition = "2021"\n',
+        "crates/foo/src/lib.rs": "",
+      });
+
+      // `#[path = "custom.rs"] mod foo;` — the name is `foo`, the file is
+      // `custom.rs`, and the declaration carries both.
+      const declared = new Map([["foo", "custom.rs"]]);
+
+      expect(
+        resolveRustImport("foo::Item", "crates/app/src/lib.rs", fileSet, crates, declared),
+      ).toBe("crates/app/src/custom.rs");
+
+      // The children sit beside that file, not under a directory named after
+      // it: rustc says `src/inner.rs` with E0583, on 1.70.0 and 1.98.0.
+      expect(
+        resolveRustImport("foo::inner::Thing", "crates/app/src/lib.rs", fileSet, crates, declared),
+      ).toBe("crates/app/src/inner.rs");
+
+      // The hand that makes this fail if the declared file is dropped: with
+      // the name alone the path found nothing and fell through to the
+      // same-named library.
+      expect(
+        resolveRustImport(
+          "foo::Item",
+          "crates/app/src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["foo", "foo"]]),
+        ),
+      ).toBeNull();
+    });
+
+    it("reaches a module an attribute inside an inline block moved", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/tests/moved.rs": "",
+      });
+
+      // Written inside `mod tests { #[path = "moved.rs"] mod fixtures; }`, the
+      // attribute counts from the file's own module directory and one level
+      // deeper per inline block — which extractImports marks with a `self/`
+      // head, since nothing in the path itself tells the two forms apart.
+      expect(
+        resolveRustImport(
+          "fixtures::build",
+          "src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["fixtures", "self/tests/moved.rs"]]),
+        ),
+      ).toBe("src/tests/moved.rs");
+    });
+
+    it("does not read a file whose name begins with self as the inline form", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/self_check.rs": "",
+      });
+
+      // `#[path = "self_check.rs"] mod checks;` is the ordinary form: the
+      // marker for the inline one is the `self/` head, separator included.
+      // Matching on `self` alone cut five characters off this path and looked
+      // for `heck.rs`.
+      expect(
+        resolveRustImport(
+          "checks::run",
+          "src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["checks", "self_check.rs"]]),
+        ),
+      ).toBe("src/self_check.rs");
+    });
+
+    it("keeps a leading :: out of the local modules for a bare head too", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // `use ::config;` beside `mod config;`: the marker says the head names a
+      // crate, and it says it in the one shape where the local module would
+      // otherwise win outright — a head with nothing below it.
+      expect(
+        resolveRustImport(
+          "::config",
+          "crates/app/src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["config", "config"]]),
+        ),
+      ).toBe("crates/config/src/lib.rs");
+    });
+
+    it("holds the declaration gate on in edition 2015 too", () => {
+      const crates = rustProject({
+        // No edition key: Cargo reads 2015, and there the path below is
+        // absolute from the crate root.
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/registry.rs": "",
+        "src/client.rs": "",
+      });
+
+      // The gate is a 2018 rule that this resolver applies to every edition,
+      // and the reason is the tail behind the alternative: answering a
+      // root-relative path means resolving one no declaration proves, and each
+      // bound put on that turned out to draw an edge rustc rejects. Both
+      // spellings stay unresolved — the multi-segment path and the bare head
+      // that arrives in the shape a declaration does.
+      expect(
+        resolveRustImport("registry::write", "src/client.rs", fileSet, crates, new Map()),
+      ).toBeNull();
+      // `false` says this is a `use` and not a `mod` declaration: the two
+      // arrive as the same string.
+      expect(
+        resolveRustImport("registry", "src/client.rs", fileSet, crates, new Map(), false),
+      ).toBeNull();
+      // And the declaration in the same position still counts from the file.
+      expect(
+        resolveRustImport("registry", "src/deep.rs", fileSet, crates, new Map(), true),
+      ).toBeNull();
+    });
+
+    it("leaves a single-segment path on the crate when no declaration names it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/bar"]\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nbar = { path = "../bar" }\n',
+        "crates/app/src/lib.rs": "",
+        // An orphan left by a refactor: on disk, in no module tree.
+        "crates/app/src/bar.rs": "",
+        "crates/bar/Cargo.toml": '[package]\nname = "bar"\nedition = "2021"\n',
+        "crates/bar/src/lib.rs": "",
+      });
+
+      // `use bar;` and `mod bar;` arrive in the same shape, and only the
+      // declaration may reach the file. cargo 1.70.0 and 1.98.0 compile
+      // `use bar;` against the dependency with that orphan sitting there.
+      expect(
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Map()),
+      ).toBe("crates/bar/src/lib.rs");
+      expect(
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Map([["bar", "bar"]])),
+      ).toBe("crates/app/src/bar.rs");
+    });
+
+    it("follows a dependency renamed in the manifest to the crate it points at", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/core"]\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nnucleus = { package = "app-core", path = "../core" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/core/Cargo.toml": '[package]\nname = "app-core"\nedition = "2021"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/core/src/state.rs": "",
+      });
+
+      // The code writes the alias, which appears in no `[package] name`.
+      expect(resolveRustImport("nucleus::state::State", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/core/src/state.rs");
+    });
+
+    it("never resolves a path to the file that wrote it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/db.rs": "",
+      });
+
+      // `use crate::db::Connection;` inside `#[cfg(test)] mod tests` in db.rs
+      // names that same file; as an edge it is a node depending on itself.
+      expect(resolveRustImport("crate::db::Connection", "src/db.rs", fileSet, crates)).toBeNull();
     });
   });
 

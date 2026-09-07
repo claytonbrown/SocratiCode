@@ -23,7 +23,7 @@ export function getSettings(): SocratiCodeSettings {
   const c = vscode.workspace.getConfiguration(SECTION);
   return {
     command: c.get<string>("command", "npx"),
-    args: c.get<string[]>("args", ["-y", "socraticode"]),
+    args: c.get<string[]>("args", ["-y", "--prefer-online", "socraticode@latest"]),
     env: c.get<Record<string, string>>("env", {}),
     showStatusBar: c.get<boolean>("statusBar", true),
   };

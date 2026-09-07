@@ -70,6 +70,7 @@
  *                              (default on). See documentIncludesPath() below.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { logger } from "./logger.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -104,6 +105,8 @@ export interface EmbeddingConfig {
   embeddingDimensions: number;
   /** Max context window in tokens. Used for client-side pre-truncation. */
   embeddingContextLength: number;
+  /** Whether LiteLLM receives the output-dimension request parameter. */
+  litellmSendDimensions: boolean;
   ollamaApiKey?: string;
 }
 
@@ -190,8 +193,8 @@ export function queryPrefix(): string {
 
 /**
  * Task prefix for documents, from `EMBEDDING_DOCUMENT_PREFIX`. Change it only
- * together with {@link queryPrefix} — an asymmetric pair ranks badly — and
- * re-index from scratch afterwards, since existing vectors encode the old one.
+ * together with {@link queryPrefix}; an asymmetric pair ranks badly. Existing
+ * collections retain their persisted effective pair until freshly indexed.
  */
 export function documentPrefix(): string {
   return process.env.EMBEDDING_DOCUMENT_PREFIX ?? DEFAULT_DOCUMENT_PREFIX;
@@ -222,6 +225,13 @@ function parseBooleanEnv(name: string, raw: string | undefined, defaultValue: bo
   );
 }
 
+/** Preserve LiteLLM's released opt-in semantics for this existing flag. */
+function litellmDimensionsEnabled(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const value = raw.toLowerCase();
+  return value === "true" || value === "1" || value === "yes";
+}
+
 /**
  * Whether the file path is embedded alongside the chunk content, from
  * `EMBEDDING_DOCUMENT_INCLUDE_PATH`.
@@ -248,6 +258,7 @@ export function documentIncludesPath(): boolean {
 // ── Singleton ─────────────────────────────────────────────────────────────
 
 let _config: EmbeddingConfig | null = null;
+const effectiveConfigStorage = new AsyncLocalStorage<EmbeddingConfig>();
 
 /**
  * Load embedding configuration from environment variables.
@@ -391,6 +402,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
           return parsed;
         })()
       : guessContextLength(embeddingModel),
+    litellmSendDimensions: litellmDimensionsEnabled(process.env.LITELLM_SEND_DIMENSIONS),
     ollamaApiKey: process.env.OLLAMA_API_KEY || undefined,
     ollamaMaxConnections,
   };
@@ -408,7 +420,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     } : {}),
     ...(embeddingProvider === "litellm" ? {
       litellmUrl: _config.litellmUrl,
-      sendDimensions: !!process.env.LITELLM_SEND_DIMENSIONS,
+      sendDimensions: _config.litellmSendDimensions,
     } : {}),
     embeddingModel: _config.embeddingModel,
     embeddingDimensions: _config.embeddingDimensions,
@@ -434,7 +446,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
   // results quietly get worse.
   if (querySet !== documentSet) {
     logger.warn(
-      "Only one side of the embedding task prefixes is set: EMBEDDING_QUERY_PREFIX and EMBEDDING_DOCUMENT_PREFIX should be set together, and changing the document prefix requires a full re-index (codebase_remove, then codebase_index).",
+      "Only one side of the embedding task prefixes is set: EMBEDDING_QUERY_PREFIX and EMBEDDING_DOCUMENT_PREFIX should be set together. Existing collections retain their effective pair; use codebase_remove, then codebase_index, to activate the requested pair.",
       { queryPrefixSet: querySet, documentPrefixSet: documentSet },
     );
   }
@@ -444,7 +456,30 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
 
 /** Get the current embedding configuration (loads if not yet loaded). */
 export function getEmbeddingConfig(): EmbeddingConfig {
-  return loadEmbeddingConfig();
+  return effectiveConfigStorage.getStore() ?? loadEmbeddingConfig();
+}
+
+/**
+ * Run one embedding operation with collection-specific output-shaping values.
+ * Connectivity and credentials stay sourced from the live runtime config; only
+ * values that define the vector space are overridden. AsyncLocalStorage keeps
+ * concurrent searches for differently-profiled collections isolated.
+ */
+export function withEmbeddingConfig<T>(
+  overrides: Pick<
+    EmbeddingConfig,
+    | "embeddingProvider"
+    | "embeddingModel"
+    | "embeddingDimensions"
+    | "embeddingContextLength"
+    | "litellmSendDimensions"
+  >,
+  operation: () => T,
+): T {
+  return effectiveConfigStorage.run(
+    { ...loadEmbeddingConfig(), ...overrides },
+    operation,
+  );
 }
 
 /**
@@ -452,6 +487,11 @@ export function getEmbeddingConfig(): EmbeddingConfig {
  * Called by OllamaEmbeddingProvider when OLLAMA_MODE=auto resolves.
  */
 export function setResolvedOllamaMode(mode: "docker" | "external", url: string): void {
+  const effective = effectiveConfigStorage.getStore();
+  if (effective) {
+    effective.ollamaMode = mode;
+    effective.ollamaUrl = url;
+  }
   if (_config) {
     _config.ollamaMode = mode;
     _config.ollamaUrl = url;

@@ -14,7 +14,11 @@
  *   EMBEDDING_DIMENSIONS=3072               (default for gemini-embedding-001)
  */
 
-import { type GenerativeModel, GoogleGenerativeAI } from "@google/generative-ai";
+import {
+  type EmbedContentRequest,
+  type GenerativeModel,
+  GoogleGenerativeAI,
+} from "@google/generative-ai";
 import { getEmbeddingConfig } from "./embedding-config.js";
 import type { EmbeddingHealthStatus, EmbeddingProvider, EmbeddingReadinessResult } from "./embedding-types.js";
 import { logger } from "./logger.js";
@@ -25,6 +29,16 @@ import { logger } from "./logger.js";
  * Google batchEmbedContents supports up to 100 texts per request.
  */
 const GOOGLE_BATCH_SIZE = 100;
+
+/**
+ * The installed legacy SDK predates `embedContentConfig` in its declarations,
+ * but forwards request properties unchanged to the Gemini REST endpoint. The
+ * v1beta API marks top-level `outputDimensionality` as deprecated in favor of
+ * this nested field: https://ai.google.dev/api/embeddings
+ */
+interface DimensionedEmbedContentRequest extends EmbedContentRequest {
+  embedContentConfig: { outputDimensionality: number };
+}
 
 /** Max input tokens for gemini-embedding-001 (2048 tokens). */
 const GOOGLE_MAX_TOKENS = 2048;
@@ -102,14 +116,18 @@ export class GoogleEmbeddingProvider implements EmbeddingProvider {
 
     // Use batchEmbedContents for efficiency
     if (truncated.length <= GOOGLE_BATCH_SIZE) {
-      return this._embedBatch(model, truncated);
+      return this._embedBatch(model, truncated, config.embeddingDimensions);
     }
 
     // Split into sub-batches
     const results: number[][] = [];
     for (let i = 0; i < truncated.length; i += GOOGLE_BATCH_SIZE) {
       const batch = truncated.slice(i, i + GOOGLE_BATCH_SIZE);
-      const embeddings = await this._embedBatch(model, batch);
+      const embeddings = await this._embedBatch(
+        model,
+        batch,
+        config.embeddingDimensions,
+      );
       results.push(...embeddings);
     }
     return results;
@@ -149,9 +167,14 @@ export class GoogleEmbeddingProvider implements EmbeddingProvider {
     }
   }
 
-  private async _embedBatch(model: GenerativeModel, texts: string[]): Promise<number[][]> {
-    const requests = texts.map((text) => ({
+  private async _embedBatch(
+    model: GenerativeModel,
+    texts: string[],
+    outputDimensionality: number,
+  ): Promise<number[][]> {
+    const requests: DimensionedEmbedContentRequest[] = texts.map((text) => ({
       content: { role: "user" as const, parts: [{ text }] },
+      embedContentConfig: { outputDimensionality },
     }));
 
     const response = await model.batchEmbedContents({ requests });

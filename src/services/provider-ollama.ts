@@ -151,16 +151,20 @@ function pretruncateTexts(texts: string[], contextLength: number): string[] {
 
 const READINESS_TTL_MS = 60_000;
 let ollamaReadyAt = 0;
+let ollamaReadyIdentity: string | null = null;
 
 /** Reset the cached readiness state */
 export function resetOllamaReadinessCache(): void {
   ollamaReadyAt = 0;
+  ollamaReadyIdentity = null;
 }
 
 // ── Auto-detection (OLLAMA_MODE=auto) ────────────────────────────────────
 
 /** Whether the auto-detection probe has run yet */
 let _autoDetected = false;
+let _autoDetectedMode: "docker" | "external" | null = null;
+let _autoDetectedUrl: string | null = null;
 
 /**
  * Probe localhost:11434 to see if a native Ollama is already running.
@@ -169,10 +173,11 @@ let _autoDetected = false;
  * Calls setResolvedOllamaMode() to update the config singleton in place.
  */
 async function detectNativeOllama(): Promise<boolean> {
-  if (_autoDetected) {
-    // Already resolved — config was updated in place on first run
-    const config = getEmbeddingConfig();
-    return config.ollamaMode === "external";
+  if (_autoDetected && _autoDetectedMode && _autoDetectedUrl) {
+    // Async-local effective profiles do not share mutable config objects. Apply
+    // the cached probe result to the current operation as well as reusing it.
+    setResolvedOllamaMode(_autoDetectedMode, _autoDetectedUrl);
+    return _autoDetectedMode === "external";
   }
   _autoDetected = true;
   try {
@@ -181,21 +186,27 @@ async function detectNativeOllama(): Promise<boolean> {
     const resp = await fetch("http://localhost:11434/api/tags", { signal: controller.signal });
     clearTimeout(timeoutId);
     if (resp.ok) {
+      _autoDetectedMode = "external";
+      _autoDetectedUrl = "http://localhost:11434";
       logger.info("Auto-mode: native Ollama detected at http://localhost:11434 — using external mode (GPU-accelerated if available)");
-      setResolvedOllamaMode("external", "http://localhost:11434");
+      setResolvedOllamaMode(_autoDetectedMode, _autoDetectedUrl);
       return true;
     }
   } catch {
     // not reachable
   }
+  _autoDetectedMode = "docker";
+  _autoDetectedUrl = "http://localhost:11435";
   logger.info("Auto-mode: no native Ollama found — using managed Docker container");
-  setResolvedOllamaMode("docker", "http://localhost:11435");
+  setResolvedOllamaMode(_autoDetectedMode, _autoDetectedUrl);
   return false;
 }
 
 /** Reset the auto-detection cache (for testing). */
 export function resetAutoDetectionCache(): void {
   _autoDetected = false;
+  _autoDetectedMode = null;
+  _autoDetectedUrl = null;
 }
 
 // ── Provider class ──────────────────────────────────────────────────────
@@ -209,15 +220,23 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   }
 
   async ensureReady(): Promise<EmbeddingReadinessResult> {
-    // Fast path: recently verified as ready
-    if (Date.now() - ollamaReadyAt < READINESS_TTL_MS) {
-      return { modelPulled: false, containerStarted: false, imagePulled: false };
-    }
-
     // Resolve auto-mode before anything else (probes localhost:11434, updates config in place)
-    const config = getEmbeddingConfig();
+    let config = getEmbeddingConfig();
     if (config.ollamaMode === "auto") {
       await detectNativeOllama();
+      config = getEmbeddingConfig();
+    }
+
+    const readinessIdentity = JSON.stringify({
+      url: config.ollamaUrl,
+      model: config.embeddingModel,
+      dimensions: config.embeddingDimensions,
+    });
+    if (
+      ollamaReadyIdentity === readinessIdentity &&
+      Date.now() - ollamaReadyAt < READINESS_TTL_MS
+    ) {
+      return { modelPulled: false, containerStarted: false, imagePulled: false };
     }
     let modelPulled = false;
     let containerStarted = false;
@@ -249,6 +268,7 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     }
 
     ollamaReadyAt = Date.now();
+    ollamaReadyIdentity = readinessIdentity;
     return { modelPulled, containerStarted, imagePulled };
   }
 

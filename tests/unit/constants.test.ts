@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CHUNK_OVERLAP,
   CHUNK_SIZE,
   detectExtensionlessExtension,
   getLanguageFromExtension,
+  getWatcherMode,
   INDEX_BATCH_SIZE,
   indexExtensionlessEnabled,
   MAX_AVG_LINE_LENGTH,
@@ -34,6 +35,35 @@ import {
 } from "../../src/constants.js";
 
 describe("constants", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  describe("watcher mode", () => {
+    it("defaults to auto when SOCRATICODE_WATCHER is unset or empty", () => {
+      vi.stubEnv("SOCRATICODE_WATCHER", undefined);
+      expect(getWatcherMode()).toBe("auto");
+      vi.stubEnv("SOCRATICODE_WATCHER", "   ");
+      expect(getWatcherMode()).toBe("auto");
+    });
+
+    it("accepts auto, manual, and off case-insensitively", () => {
+      vi.stubEnv("SOCRATICODE_WATCHER", " AUTO ");
+      expect(getWatcherMode()).toBe("auto");
+      vi.stubEnv("SOCRATICODE_WATCHER", " Manual ");
+      expect(getWatcherMode()).toBe("manual");
+      vi.stubEnv("SOCRATICODE_WATCHER", " OFF ");
+      expect(getWatcherMode()).toBe("off");
+    });
+
+    it("rejects unknown values instead of silently enabling automatic writes", () => {
+      vi.stubEnv("SOCRATICODE_WATCHER", "disabled");
+      expect(() => getWatcherMode()).toThrow(
+        'Invalid SOCRATICODE_WATCHER: "disabled". Must be "auto", "manual", or "off".',
+      );
+    });
+  });
+
   describe("Qdrant configuration", () => {
     it("has default port 16333", () => {
       expect(QDRANT_PORT).toBe(16333);

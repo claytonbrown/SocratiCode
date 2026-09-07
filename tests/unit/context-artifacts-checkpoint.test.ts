@@ -5,10 +5,12 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
 import type { ArtifactIndexState } from "../../src/types.js";
 
 let tempDir: string;
 let existingMetadata: ArtifactIndexState[] | null = null;
+let existingProfile: EffectiveIndexProfile | null = null;
 const saveCalls: ArtifactIndexState[][] = [];
 
 vi.mock("../../src/services/embeddings.js", () => ({
@@ -20,6 +22,16 @@ vi.mock("../../src/services/embeddings.js", () => ({
   ),
 }));
 
+vi.mock("../../src/services/embedding-provider.js", () => ({
+  getEmbeddingProvider: vi.fn(async () => ({
+    ensureReady: vi.fn(async () => ({
+      modelPulled: false,
+      containerStarted: false,
+      imagePulled: false,
+    })),
+  })),
+}));
+
 vi.mock("../../src/services/qdrant.js", () => ({
   deleteArtifactChunks: vi.fn(async () => undefined),
   deleteCollection: vi.fn(async () => undefined),
@@ -27,14 +39,20 @@ vi.mock("../../src/services/qdrant.js", () => ({
   ensureCollection: vi.fn(async () => undefined),
   ensurePayloadIndex: vi.fn(async () => undefined),
   getCollectionInfo: vi.fn(async () => ({ pointsCount: 1 })),
-  loadContextMetadata: vi.fn(async () => existingMetadata),
+  loadContextIndexMetadata: vi.fn(async () =>
+    existingMetadata === null && existingProfile === null
+      ? null
+      : { artifacts: existingMetadata ?? [], effectiveProfile: existingProfile },
+  ),
   saveContextMetadata: vi.fn(async (
     _collection: string,
     _projectPath: string,
     artifacts: ArtifactIndexState[],
+    effectiveProfile: EffectiveIndexProfile,
   ) => {
     saveCalls.push([...artifacts]);
     existingMetadata = [...artifacts];
+    existingProfile = effectiveProfile;
   }),
   searchChunks: vi.fn(async () => []),
   searchChunksWithFilter: vi.fn(async () => []),
@@ -47,6 +65,7 @@ const { ensureArtifactsIndexed, indexAllArtifacts } = await import(
 
 beforeEach(async () => {
   existingMetadata = null;
+  existingProfile = null;
   saveCalls.length = 0;
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "socraticode-checkpoint-test-"));
 });
@@ -83,8 +102,9 @@ describe("context artifact metadata checkpoints", () => {
     expect(errors).toHaveLength(0);
     expect(indexed.map((a) => a.name)).toEqual(["a", "b"]);
     expect(saveCalls.length).toBeGreaterThanOrEqual(2);
-    expect(saveCalls[0].map((a) => a.name)).toEqual(["a"]);
-    expect(saveCalls[1].map((a) => a.name)).toEqual(["a", "b"]);
+    expect(saveCalls[0]).toEqual([]);
+    expect(saveCalls[1].map((a) => a.name)).toEqual(["a"]);
+    expect(saveCalls[2].map((a) => a.name)).toEqual(["a", "b"]);
   });
 
   it("keeps a successful artifact checkpoint when a later artifact fails", async () => {
@@ -102,7 +122,8 @@ describe("context artifact metadata checkpoints", () => {
 
     expect(indexed.map((a) => a.name)).toEqual(["ok"]);
     expect(errors.map((e) => e.name)).toEqual(["missing"]);
-    expect(saveCalls[0].map((a) => a.name)).toEqual(["ok"]);
+    expect(saveCalls[0]).toEqual([]);
+    expect(saveCalls[1].map((a) => a.name)).toEqual(["ok"]);
   });
 
   it("preserves existing states while checkpointing stale artifacts", async () => {

@@ -31,7 +31,7 @@ import type {
   SymbolRef,
 } from "../types.js";
 import { logger } from "./logger.js";
-import { getClient } from "./qdrant.js";
+import { getClient, isAlreadyExistsError } from "./qdrant.js";
 
 // ── Shard key helpers ────────────────────────────────────────────────────
 
@@ -58,6 +58,12 @@ export function reverseShardKey(filePath: string): number {
   return digest[0] % SYMBOL_REVERSE_SHARDS;
 }
 
+/** Map a callee symbol ID (e.g. `path/to/file.ts::symbolName`) to its reverse-call shard bucket. */
+export function reverseShardKeyForCallee(calleeId: string): number {
+  const calleeFile = calleeId.split("::")[0] ?? calleeId;
+  return reverseShardKey(calleeFile);
+}
+
 /** Format a reverse-shard bucket as a 2-char zero-padded hex string. */
 export function reverseShardHex(bucket: number): string {
   return bucket.toString(16).padStart(2, "0");
@@ -73,8 +79,9 @@ function uuidFromString(input: string): string {
 function metaPointId(projectId: string): string {
   return uuidFromString(`${projectId}::meta`);
 }
-function filePointId(projectId: string, relativePath: string): string {
-  return uuidFromString(`${projectId}::file::${relativePath}`);
+function filePointId(projectId: string, relativePath: string, generation?: string): string {
+  const genSuffix = generation ? `::gen::${generation}` : "";
+  return uuidFromString(`${projectId}::file::${relativePath}${genSuffix}`);
 }
 /**
  * Seed strings for shard point ids. Single-sourced on purpose: part 0's id and
@@ -82,17 +89,19 @@ function filePointId(projectId: string, relativePath: string): string {
  * place but not the other would strand every split shard's continuation parts
  * at unreachable ids without any type error.
  */
-function nameShardSeed(projectId: string, shardKey: string): string {
-  return `${projectId}::nameidx::${shardKey}`;
+function nameShardSeed(projectId: string, shardKey: string, generation?: string): string {
+  const genSuffix = generation ? `::gen::${generation}` : "";
+  return `${projectId}::nameidx::${shardKey}${genSuffix}`;
 }
-function revShardSeed(projectId: string, bucketHex: string): string {
-  return `${projectId}::revidx::${bucketHex}`;
+function revShardSeed(projectId: string, bucketHex: string, generation?: string): string {
+  const genSuffix = generation ? `::gen::${generation}` : "";
+  return `${projectId}::revidx::${bucketHex}${genSuffix}`;
 }
-function nameShardPointId(projectId: string, shardKey: string): string {
-  return uuidFromString(nameShardSeed(projectId, shardKey));
+function nameShardPointId(projectId: string, shardKey: string, generation?: string): string {
+  return uuidFromString(nameShardSeed(projectId, shardKey, generation));
 }
-function revShardPointId(projectId: string, bucketHex: string): string {
-  return uuidFromString(revShardSeed(projectId, bucketHex));
+function revShardPointId(projectId: string, bucketHex: string, generation?: string): string {
+  return uuidFromString(revShardSeed(projectId, bucketHex, generation));
 }
 /**
  * Id of continuation part `i` (i >= 1) of a shard whose part 0 lives at the
@@ -271,10 +280,18 @@ async function saveShardPoints<V>(
   record: Record<string, V>,
   what: string,
   payloadFor: (entries: Record<string, V>, part: number, parts: number) => Record<string, unknown>,
+  generation?: string,
 ): Promise<void> {
   const qdrant = getClient();
 
-  const single: SymgraphPoint = { id: primaryId, vector: [0], payload: payloadFor(record, 0, 1) };
+  const single: SymgraphPoint = {
+    id: primaryId,
+    vector: [0],
+    payload: {
+      ...payloadFor(record, 0, 1),
+      ...(generation ? { generation } : {}),
+    },
+  };
   const parts =
     pointBytes(single) <= QDRANT_UPSERT_BUDGET_BYTES
       ? [record]
@@ -293,7 +310,11 @@ async function saveShardPoints<V>(
       : parts.map((entries, i) => ({
           id: i === 0 ? primaryId : shardPartPointId(primaryKey, i),
           vector: [0],
-          payload: { ...payloadFor(entries, i, parts.length), write: writeId },
+          payload: {
+            ...payloadFor(entries, i, parts.length),
+            write: writeId,
+            ...(generation ? { generation } : {}),
+          },
         }));
 
   // How many continuation parts did the previous write leave? Read the old
@@ -321,11 +342,37 @@ async function saveShardPoints<V>(
   }
 }
 
+export class StorageReadError extends Error {
+  constructor(message: string, public readonly context?: Record<string, unknown>) {
+    super(message);
+    this.name = "StorageReadError";
+  }
+}
+
+/** Raised when a query tries to start against a superseded graph generation. */
+export class SymbolGraphGenerationChangedError extends StorageReadError {
+  constructor(
+    public readonly projectId: string,
+    public readonly generation: string,
+    public readonly activeGeneration?: string,
+  ) {
+    super("Symbol graph generation changed while the query was starting", {
+      projectId,
+      generation,
+      activeGeneration,
+    });
+    this.name = "SymbolGraphGenerationChangedError";
+  }
+}
+
+/** Internal lease/storage key for graphs written before generations existed. */
+export const LEGACY_SYMBOL_GRAPH_GENERATION = "__legacy_symbol_graph__";
+
 /**
  * Read a shard written by {@link saveShardPoints}: the point at the shard's
  * original id, plus continuation parts when it declares any. Returns the
- * merged entries, or null when a declared part is missing — the shard is then
- * incomplete and pretending otherwise would under-report quietly.
+ * merged entries, or null when genuinely absent (primary point missing), or
+ * throws StorageReadError when a declared part or payload is corrupted/missing.
  */
 async function loadShardPoints<V>(
   collName: string,
@@ -340,10 +387,24 @@ async function loadShardPoints<V>(
 
   const payload = primary[0].payload as Record<string, unknown> | null | undefined;
   const first = entriesOf(payload);
-  if (first === null) return null;
+  if (first === null) {
+    throw new StorageReadError("Shard primary payload is malformed or missing entries", logContext);
+  }
 
   const declared = payload?.parts;
-  const parts = typeof declared === "number" && declared > 1 ? declared : 1;
+  if (declared !== undefined) {
+    if (typeof declared !== "number" || !Number.isInteger(declared) || declared < 2) {
+      logger.warn("Multipart shard has a malformed header", {
+        ...logContext,
+        declaredParts: declared,
+      });
+      throw new StorageReadError("Multipart shard has a malformed header", {
+        ...logContext,
+        declaredParts: declared,
+      });
+    }
+  }
+  const parts = declared ?? 1;
   if (parts === 1) return first; // every pre-split graph, and most shards after
 
   // Fail closed on a malformed multipart header. Only saveShardPoints writes
@@ -351,13 +412,16 @@ async function loadShardPoints<V>(
   // identity, so a missing/non-integer/empty header here is corruption, and an
   // absent identity must not slide through as `undefined === undefined`.
   const writeId = payload?.write;
-  if (!Number.isInteger(parts) || typeof writeId !== "string" || writeId.length === 0) {
-    logger.warn("Multipart shard has a malformed header (returning null)", {
+  if (typeof writeId !== "string" || writeId.length === 0) {
+    logger.warn("Multipart shard has a malformed header", {
       ...logContext,
       declaredParts: declared,
       hasWriteId: typeof writeId === "string" && writeId.length > 0,
     });
-    return null;
+    throw new StorageReadError("Multipart shard has a malformed header", {
+      ...logContext,
+      declaredParts: declared,
+    });
   }
 
   const restIds: string[] = [];
@@ -376,24 +440,21 @@ async function loadShardPoints<V>(
     rest.push(...(await qdrant.retrieve(collName, { ids: restIds.slice(i, i + RETRIEVE_PART_CHUNK), with_payload: true })));
   }
   if (rest.length !== restIds.length) {
-    logger.warn("Shard is missing continuation parts (returning null)", {
+    logger.warn("Shard is missing continuation parts", {
       ...logContext,
       declaredParts: parts,
       found: rest.length + 1,
     });
-    return null;
+    throw new StorageReadError("Shard is missing continuation parts", {
+      ...logContext,
+      declaredParts: parts,
+      found: rest.length + 1,
+    });
   }
 
   const merged: Record<string, V> = { ...first };
   for (const point of rest) {
     const partPayload = point.payload as Record<string, unknown> | null | undefined;
-    // A continuation part from a DIFFERENT write than part 0 means a rewrite
-    // died partway: the ids line up (they are deterministic) but the contents
-    // are two writes interleaved. Serving the merge would return a record
-    // equal to neither write, silently — treat it exactly like a missing part.
-    // The part/parts headers are cross-checked by expected id, not response
-    // order, so a point sitting at the right id with the wrong headers is
-    // rejected as corruption too.
     const expectedPart = expectedPartById.get(String(point.id));
     if (
       partPayload?.write !== writeId ||
@@ -401,17 +462,21 @@ async function loadShardPoints<V>(
       partPayload?.part !== expectedPart ||
       partPayload?.parts !== parts
     ) {
-      logger.warn("Shard continuation part belongs to a different write or is malformed (returning null)", {
+      logger.warn("Shard continuation part belongs to a different write or is malformed", {
         ...logContext,
         declaredParts: parts,
         pointId: String(point.id),
       });
-      return null;
+      throw new StorageReadError("Shard continuation part belongs to a different write or is malformed", {
+        ...logContext,
+        declaredParts: parts,
+        pointId: String(point.id),
+      });
     }
     const entries = entriesOf(partPayload);
     if (entries === null) {
-      logger.warn("Shard continuation part has no entries (returning null)", { ...logContext });
-      return null;
+      logger.warn("Shard continuation part has no entries", { ...logContext });
+      throw new StorageReadError("Shard continuation part has no entries", logContext);
     }
     Object.assign(merged, entries);
   }
@@ -421,26 +486,47 @@ async function loadShardPoints<V>(
 // ── Collection lifecycle ─────────────────────────────────────────────────
 
 const collectionsReady = new Set<string>();
+const collectionsInFlight = new Map<string, Promise<void>>();
 
 /** Ensure a single collection exists (idempotent, cached after first success). */
 async function ensureCollection(name: string): Promise<void> {
   if (collectionsReady.has(name)) return;
-  const qdrant = getClient();
-  const collections = await qdrant.getCollections();
-  const exists = collections.collections.some((c) => c.name === name);
-  if (!exists) {
-    await qdrant.createCollection(name, {
-      vectors: { size: 1, distance: "Cosine" },
-      on_disk_payload: true,
-    });
-    logger.info("Created symbol-graph collection", { name });
+  const current = collectionsInFlight.get(name);
+  if (current) return current;
+
+  const attempt = (async () => {
+    const qdrant = getClient();
+    const collections = await qdrant.getCollections();
+    const exists = collections.collections.some((c) => c.name === name);
+    if (!exists) {
+      try {
+        await qdrant.createCollection(name, {
+          vectors: { size: 1, distance: "Cosine" },
+          on_disk_payload: true,
+        });
+        logger.info("Created symbol-graph collection", { name });
+      } catch (err) {
+        if (!isAlreadyExistsError(err)) throw err;
+        logger.info("Symbol-graph collection already created by another process", { name });
+      }
+    }
+  })();
+  collectionsInFlight.set(name, attempt);
+
+  try {
+    await attempt;
+    // A test-only reset may have removed this attempt while it was running.
+    // Only the current attempt may publish readiness.
+    if (collectionsInFlight.get(name) === attempt) collectionsReady.add(name);
+  } finally {
+    if (collectionsInFlight.get(name) === attempt) collectionsInFlight.delete(name);
   }
-  collectionsReady.add(name);
 }
 
 /** Reset readiness cache (testing only). */
 export function resetSymbolGraphCollectionCache(): void {
   collectionsReady.clear();
+  collectionsInFlight.clear();
 }
 
 /** Ensure all three symbol-graph collections exist for a project. */
@@ -466,6 +552,7 @@ export async function saveSymbolGraphMeta(
   // this file has no unguarded upsert path (#99).
   assertPointFits(point, "symbol graph metadata");
   await qdrant.upsert(collName, { points: [point] });
+  setActiveSymbolGraphGeneration(projectId, meta.generation);
 }
 
 export async function loadSymbolGraphMeta(
@@ -481,7 +568,14 @@ export async function loadSymbolGraphMeta(
     });
     if (points.length === 0) return null;
     const payload = points[0].payload;
-    return (payload?.meta as SymbolGraphMeta) ?? null;
+    const meta = (payload?.meta as SymbolGraphMeta) ?? null;
+    if (meta && meta.schemaVersion === undefined) {
+      meta.schemaVersion = 1;
+    }
+    if (meta) {
+      setActiveSymbolGraphGeneration(projectId, meta.generation);
+    }
+    return meta;
   } catch (err) {
     logger.warn("loadSymbolGraphMeta failed (returning null)", {
       projectId,
@@ -491,19 +585,33 @@ export async function loadSymbolGraphMeta(
   }
 }
 
+async function resolveReadGeneration(
+  projectId: string,
+  generation?: string,
+): Promise<string | undefined> {
+  if (generation === LEGACY_SYMBOL_GRAPH_GENERATION) return undefined;
+  if (generation !== undefined) return generation;
+  const meta = await loadSymbolGraphMeta(projectId);
+  return meta?.generation;
+}
+
 // ── Per-file payloads ────────────────────────────────────────────────────
 
 export async function saveFilePayload(
   projectId: string,
   payload: SymbolGraphFilePayload,
+  generation?: string,
 ): Promise<void> {
   const collName = symgraphFileCollectionName(projectId);
   await ensureCollection(collName);
   const qdrant = getClient();
   const point: SymgraphPoint = {
-    id: filePointId(projectId, payload.file),
+    id: filePointId(projectId, payload.file, generation),
     vector: [0],
-    payload: { filePayload: payload },
+    payload: {
+      filePayload: payload,
+      ...(generation ? { generation } : {}),
+    },
   };
   assertPointFits(point, `symbol payload for ${payload.file}`);
   await qdrant.upsert(collName, { points: [point] });
@@ -518,14 +626,18 @@ export async function saveFilePayload(
 export async function saveFilePayloads(
   projectId: string,
   payloads: SymbolGraphFilePayload[],
+  generation?: string,
 ): Promise<void> {
   if (payloads.length === 0) return;
   const collName = symgraphFileCollectionName(projectId);
   await ensureCollection(collName);
   const points: SymgraphPoint[] = payloads.map((p) => ({
-    id: filePointId(projectId, p.file),
+    id: filePointId(projectId, p.file, generation),
     vector: [0],
-    payload: { filePayload: p },
+    payload: {
+      filePayload: p,
+      ...(generation ? { generation } : {}),
+    },
   }));
   await upsertWithinBudget(collName, points, (i) => `symbol payload for ${payloads[i].file}`);
 }
@@ -533,43 +645,56 @@ export async function saveFilePayloads(
 export async function loadFilePayload(
   projectId: string,
   relativePath: string,
+  generation?: string,
 ): Promise<SymbolGraphFilePayload | null> {
   try {
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
     const qdrant = getClient();
     const points = await qdrant.retrieve(collName, {
-      ids: [filePointId(projectId, relativePath)],
+      ids: [filePointId(projectId, relativePath, gen)],
       with_payload: true,
     });
     if (points.length === 0) return null;
     return (points[0].payload?.filePayload as SymbolGraphFilePayload) ?? null;
   } catch (err) {
-    logger.warn("loadFilePayload failed (returning null)", {
+    logger.warn("loadFilePayload failed", {
       projectId,
       file: relativePath,
       error: err instanceof Error ? err.message : String(err),
     });
-    return null;
+    throw new StorageReadError("loadFilePayload failed", {
+      projectId,
+      file: relativePath,
+      cause: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
 export async function deleteFilePayload(
   projectId: string,
   relativePath: string,
+  generation?: string,
 ): Promise<void> {
   try {
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
     const qdrant = getClient();
     await qdrant.delete(collName, {
-      points: [filePointId(projectId, relativePath)],
+      points: [filePointId(projectId, relativePath, gen)],
     });
   } catch (err) {
-    logger.warn("deleteFilePayload failed (ignored)", {
+    logger.warn("deleteFilePayload failed", {
       projectId,
       file: relativePath,
       error: err instanceof Error ? err.message : String(err),
+    });
+    throw new StorageReadError("deleteFilePayload failed", {
+      projectId,
+      file: relativePath,
+      cause: err instanceof Error ? err.message : String(err),
     });
   }
 }
@@ -580,43 +705,46 @@ export async function saveNameShard(
   projectId: string,
   shardKey: string,
   nameToSymbols: Record<string, SymbolRef[]>,
+  generation?: string,
 ): Promise<void> {
   const collName = symgraphIndexCollectionName(projectId);
   await ensureCollection(collName);
   await saveShardPoints(
     collName,
-    nameShardSeed(projectId, shardKey),
-    nameShardPointId(projectId, shardKey),
+    nameShardSeed(projectId, shardKey, generation),
+    nameShardPointId(projectId, shardKey, generation),
     nameToSymbols,
     `name index shard '${shardKey}'`,
     (entries, part, parts) =>
       parts === 1
         ? { kind: "name", shard: shardKey, nameToSymbols: entries }
         : { kind: "name", shard: shardKey, part, parts, nameToSymbols: entries },
+    generation,
   );
 }
 
 export async function loadNameShard(
   projectId: string,
   shardKey: string,
+  generation?: string,
 ): Promise<Record<string, SymbolRef[]> | null> {
   try {
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphIndexCollectionName(projectId);
     await ensureCollection(collName);
     return await loadShardPoints<SymbolRef[]>(
       collName,
-      nameShardSeed(projectId, shardKey),
-      nameShardPointId(projectId, shardKey),
+      nameShardSeed(projectId, shardKey, gen),
+      nameShardPointId(projectId, shardKey, gen),
       (payload) => (payload?.nameToSymbols as Record<string, SymbolRef[]>) ?? null,
       { projectId, shardKey },
     );
   } catch (err) {
-    logger.warn("loadNameShard failed (returning null)", {
-      projectId,
-      shardKey,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
+    if (err instanceof StorageReadError) throw err;
+    throw new StorageReadError(
+      `loadNameShard failed for shard '${shardKey}': ${err instanceof Error ? err.message : String(err)}`,
+      { projectId, shardKey },
+    );
   }
 }
 
@@ -626,45 +754,326 @@ export async function saveReverseShard(
   projectId: string,
   bucket: number,
   reverseEdges: Record<string, string[]>,
+  generation?: string,
 ): Promise<void> {
   const collName = symgraphIndexCollectionName(projectId);
   await ensureCollection(collName);
   const bucketHex = reverseShardHex(bucket);
   await saveShardPoints(
     collName,
-    revShardSeed(projectId, bucketHex),
-    revShardPointId(projectId, bucketHex),
+    revShardSeed(projectId, bucketHex, generation),
+    revShardPointId(projectId, bucketHex, generation),
     reverseEdges,
     `reverse-call index shard ${bucketHex}`,
     (entries, part, parts) =>
       parts === 1
         ? { kind: "reverse", bucket, reverseEdges: entries }
         : { kind: "reverse", bucket, part, parts, reverseEdges: entries },
+    generation,
   );
 }
 
 export async function loadReverseShard(
   projectId: string,
   bucket: number,
+  generation?: string,
 ): Promise<Record<string, string[]> | null> {
   try {
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphIndexCollectionName(projectId);
     await ensureCollection(collName);
     const bucketHex = reverseShardHex(bucket);
     return await loadShardPoints<string[]>(
       collName,
-      revShardSeed(projectId, bucketHex),
-      revShardPointId(projectId, bucketHex),
+      revShardSeed(projectId, bucketHex, gen),
+      revShardPointId(projectId, bucketHex, gen),
       (payload) => (payload?.reverseEdges as Record<string, string[]>) ?? null,
       { projectId, bucket },
     );
   } catch (err) {
-    logger.warn("loadReverseShard failed (returning null)", {
+    if (err instanceof StorageReadError) throw err;
+    throw new StorageReadError(
+      `loadReverseShard failed for bucket ${bucket}: ${err instanceof Error ? err.message : String(err)}`,
+      { projectId, bucket },
+    );
+  }
+}
+
+// ── Generation lifecycle and coordination ───────────────────────────────
+
+const projectLocks = new Map<string, Promise<void>>();
+const stagingGenerationsByProject = new Map<string, Set<string>>();
+const activeReadersByProject = new Map<string, Map<string, number>>();
+const deferredDeletionsByProject = new Map<string, Set<string>>();
+const activeGenerationByProject = new Map<string, string>();
+const deletingGenerationsByProject = new Map<string, Set<string>>();
+
+/** Record the generation named by the project's committed metadata pointer. */
+export function setActiveSymbolGraphGeneration(
+  projectId: string,
+  generation?: string,
+): void {
+  if (generation) {
+    activeGenerationByProject.set(projectId, generation);
+  } else {
+    activeGenerationByProject.delete(projectId);
+  }
+}
+
+function markGenerationDeleting(projectId: string, generation: string): void {
+  let set = deletingGenerationsByProject.get(projectId);
+  if (!set) {
+    set = new Set();
+    deletingGenerationsByProject.set(projectId, set);
+  }
+  set.add(generation);
+}
+
+function unmarkGenerationDeleting(projectId: string, generation: string): void {
+  const set = deletingGenerationsByProject.get(projectId);
+  if (!set) return;
+  set.delete(generation);
+  if (set.size === 0) deletingGenerationsByProject.delete(projectId);
+}
+
+/**
+ * Coordinate staging, activation, and cleanup operations per project.
+ * Guarantees operations for the same projectId do not interleave concurrently.
+ */
+export async function coordinateProject<T>(
+  projectId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const current = projectLocks.get(projectId) ?? Promise.resolve();
+  let release: () => void = () => {};
+  const next = new Promise<void>((res) => {
+    release = res;
+  });
+  const chained = current.then(
+    () => next,
+    () => next,
+  );
+  projectLocks.set(projectId, chained);
+  await current;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (projectLocks.get(projectId) === chained) {
+      projectLocks.delete(projectId);
+    }
+  }
+}
+
+export function registerStagingGeneration(projectIdOrGen: string, gen?: string): void {
+  const projectId = gen !== undefined ? projectIdOrGen : "";
+  const generation = gen !== undefined ? gen : projectIdOrGen;
+  if (!generation) return;
+  let set = stagingGenerationsByProject.get(projectId);
+  if (!set) {
+    set = new Set();
+    stagingGenerationsByProject.set(projectId, set);
+  }
+  set.add(generation);
+}
+
+export function unregisterStagingGeneration(projectIdOrGen: string, gen?: string): void {
+  const projectId = gen !== undefined ? projectIdOrGen : "";
+  const generation = gen !== undefined ? gen : projectIdOrGen;
+  if (!generation) return;
+  const set = stagingGenerationsByProject.get(projectId);
+  if (set) {
+    set.delete(generation);
+    if (set.size === 0) stagingGenerationsByProject.delete(projectId);
+  }
+}
+
+export function getStagingGenerations(projectId: string): string[] {
+  const projectSpecific = stagingGenerationsByProject.get(projectId);
+  const legacyGlobal = stagingGenerationsByProject.get("");
+  const all = new Set<string>([
+    ...(projectSpecific ?? []),
+    ...(legacyGlobal ?? []),
+  ]);
+  return Array.from(all);
+}
+
+export function retainReader(
+  projectId: string,
+  generation?: string,
+  allowSupersededGeneration = false,
+): void {
+  const readerGeneration = generation ?? LEGACY_SYMBOL_GRAPH_GENERATION;
+  const activeGeneration = activeGenerationByProject.get(projectId);
+  const isDeleting = deletingGenerationsByProject.get(projectId)?.has(readerGeneration) ?? false;
+  if (
+    isDeleting
+    || (!allowSupersededGeneration && activeGeneration !== undefined && readerGeneration !== activeGeneration)
+  ) {
+    throw new SymbolGraphGenerationChangedError(
       projectId,
-      bucket,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
+      readerGeneration,
+      activeGeneration,
+    );
+  }
+  let map = activeReadersByProject.get(projectId);
+  if (!map) {
+    map = new Map();
+    activeReadersByProject.set(projectId, map);
+  }
+  map.set(readerGeneration, (map.get(readerGeneration) ?? 0) + 1);
+}
+
+export function releaseReader(projectId: string, generation?: string): void {
+  const readerGeneration = generation ?? LEGACY_SYMBOL_GRAPH_GENERATION;
+  const map = activeReadersByProject.get(projectId);
+  if (!map) return;
+  const count = (map.get(readerGeneration) ?? 1) - 1;
+  if (count <= 0) {
+    map.delete(readerGeneration);
+    if (map.size === 0) activeReadersByProject.delete(projectId);
+    const deferred = deferredDeletionsByProject.get(projectId);
+    if (deferred?.has(readerGeneration)) {
+      deferred.delete(readerGeneration);
+      if (deferred.size === 0) deferredDeletionsByProject.delete(projectId);
+      // Mark synchronously before the asynchronous delete starts. A stale
+      // cache cannot acquire a new lease in the gap between release and I/O.
+      markGenerationDeleting(projectId, readerGeneration);
+      deleteGeneration(projectId, readerGeneration)
+        .catch((err) => {
+          logger.warn("Deferred generation deletion failed", {
+            projectId,
+            generation: readerGeneration,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          unmarkGenerationDeleting(projectId, readerGeneration);
+        });
+    }
+  } else {
+    map.set(readerGeneration, count);
+  }
+}
+
+export function getActiveReaderGenerations(projectId: string): string[] {
+  const map = activeReadersByProject.get(projectId);
+  return map ? Array.from(map.keys()) : [];
+}
+
+export function hasActiveReaders(projectId: string, generation: string): boolean {
+  return (activeReadersByProject.get(projectId)?.get(generation) ?? 0) > 0;
+}
+
+export function resetGenerationLifecycleState(): void {
+  projectLocks.clear();
+  stagingGenerationsByProject.clear();
+  activeReadersByProject.clear();
+  deferredDeletionsByProject.clear();
+  activeGenerationByProject.clear();
+  deletingGenerationsByProject.clear();
+}
+
+/** Delete all points belonging to a specific generation from file and index collections. */
+export async function deleteGeneration(projectId: string, generation: string): Promise<void> {
+  if (!generation) return;
+  const qdrant = getClient();
+  const collNames = [
+    symgraphFileCollectionName(projectId),
+    symgraphIndexCollectionName(projectId),
+  ];
+  for (const collName of collNames) {
+    try {
+      await qdrant.delete(collName, {
+        wait: true,
+        filter: generation === LEGACY_SYMBOL_GRAPH_GENERATION
+          ? { must: [{ is_empty: { key: "generation" } }] }
+          : { must: [{ key: "generation", match: { value: generation } }] },
+      });
+    } catch (err) {
+      logger.warn("deleteGeneration: failed to delete points for generation", {
+        projectId,
+        generation,
+        collName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/** Find all distinct generation IDs present in storage for a project. */
+export async function listStoredGenerations(projectId: string): Promise<string[]> {
+  const qdrant = getClient();
+  const generations = new Set<string>();
+  const collNames = [
+    symgraphFileCollectionName(projectId),
+    symgraphIndexCollectionName(projectId),
+  ];
+
+  for (const collName of collNames) {
+    try {
+      let offset: string | number | Record<string, unknown> | undefined;
+      while (true) {
+        const res = await qdrant.scroll(collName, {
+          limit: 500,
+          with_payload: ["generation"],
+          with_vector: false,
+          offset: offset as string | number | undefined,
+        });
+        for (const pt of res.points) {
+          const gen = pt.payload?.generation;
+          if (typeof gen === "string" && gen.length > 0) {
+            generations.add(gen);
+          } else {
+            generations.add(LEGACY_SYMBOL_GRAPH_GENERATION);
+          }
+        }
+        if (!res.next_page_offset) break;
+        offset = res.next_page_offset;
+      }
+    } catch {
+      // Collection may not exist yet
+    }
+  }
+  return Array.from(generations);
+}
+
+/**
+ * Remove points belonging to superseded or abandoned generations, keeping activeGeneration,
+ * generations currently in staging, and generations held by active readers.
+ */
+export async function cleanStaleGenerations(
+  projectId: string,
+  activeGeneration: string,
+): Promise<void> {
+  if (!activeGeneration) return;
+  setActiveSymbolGraphGeneration(projectId, activeGeneration);
+  const stagingGens = new Set(getStagingGenerations(projectId));
+  const storedGens = await listStoredGenerations(projectId);
+
+  // Retire each known stale generation explicitly. Lease acquisition and the
+  // deletion decision are synchronous within one event-loop turn: a reader
+  // acquired while storage was being listed is observed here, while a reader
+  // arriving after markGenerationDeleting is rejected before any I/O begins.
+  for (const gen of storedGens) {
+    if (gen === activeGeneration || stagingGens.has(gen)) continue;
+
+    if (hasActiveReaders(projectId, gen)) {
+      let deferred = deferredDeletionsByProject.get(projectId);
+      if (!deferred) {
+        deferred = new Set();
+        deferredDeletionsByProject.set(projectId, deferred);
+      }
+      deferred.add(gen);
+      continue;
+    }
+
+    markGenerationDeleting(projectId, gen);
+    try {
+      await deleteGeneration(projectId, gen);
+    } finally {
+      unmarkGenerationDeleting(projectId, gen);
+    }
   }
 }
 

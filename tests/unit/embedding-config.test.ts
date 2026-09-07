@@ -217,6 +217,7 @@ describe("embedding-config", () => {
         embeddingModel: "mxbai-embed-large",
         embeddingDimensions: 1024,
         embeddingContextLength: 512,
+        litellmSendDimensions: false,
         ollamaApiKey: "secret",
         ollamaMaxConnections: 4,
       });

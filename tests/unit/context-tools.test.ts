@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-/**
- * Unit tests for the ensureOllamaReady conditional guard in context-tools.ts.
- * Verifies that codebase_context_index and codebase_context_search only call
- * ensureOllamaReady() for the Ollama provider, and use getEmbeddingProvider()
- * for OpenAI/Google.
- */
+/** Unit tests for context-tool routing and result formatting. */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -21,41 +16,6 @@ vi.mock("../../src/services/logger.js", () => ({
   },
 }));
 
-// ── embedding-config.js mock ─────────────────────────────────────────────
-
-const mockGetEmbeddingConfig = vi.fn(() => ({
-  embeddingProvider: "ollama" as string,
-  embeddingModel: "test-model",
-}));
-
-vi.mock("../../src/services/embedding-config.js", () => ({
-  getEmbeddingConfig: (...args: unknown[]) => mockGetEmbeddingConfig(...(args as [])),
-}));
-
-// ── embedding-provider.js mock ───────────────────────────────────────────
-
-const mockGetEmbeddingProvider = vi.fn(async () => ({
-  embed: vi.fn(),
-  ensureReady: vi.fn(async () => ({ imagePulled: false, containerStarted: false, modelPulled: false })),
-  health: vi.fn(),
-}));
-
-vi.mock("../../src/services/embedding-provider.js", () => ({
-  getEmbeddingProvider: (...args: unknown[]) => mockGetEmbeddingProvider(...(args as [])),
-}));
-
-// ── ollama.js mock ───────────────────────────────────────────────────────
-
-const mockEnsureOllamaReady = vi.fn(async () => ({
-  modelPulled: false,
-  containerStarted: false,
-  imagePulled: false,
-}));
-
-vi.mock("../../src/services/ollama.js", () => ({
-  ensureOllamaReady: (...args: unknown[]) => mockEnsureOllamaReady(...(args as [])),
-}));
-
 // ── docker.js mock ───────────────────────────────────────────────────────
 
 vi.mock("../../src/services/docker.js", () => ({
@@ -65,8 +25,10 @@ vi.mock("../../src/services/docker.js", () => ({
 
 // ── qdrant.js mock ───────────────────────────────────────────────────────
 
+const mockGetCollectionInfo = vi.fn(async (): Promise<{ pointsCount: number } | null> => null);
+
 vi.mock("../../src/services/qdrant.js", () => ({
-  getCollectionInfo: vi.fn(async () => null),
+  getCollectionInfo: (...args: unknown[]) => mockGetCollectionInfo(...(args as [string])),
   loadContextMetadata: vi.fn(async () => null),
 }));
 
@@ -87,6 +49,11 @@ vi.mock("../../src/services/indexer.js", () => ({
 
 const mockIndexAllArtifacts = vi.fn(async (_path: string) => ({ indexed: [], errors: [] }));
 const mockSearchArtifacts = vi.fn(async (_collection: string, _query: string, _limit: number) => []);
+const mockEnsureArtifactsIndexed = vi.fn(async (_path: string) => ({
+  reindexed: [],
+  upToDate: [],
+  errors: [],
+}));
 
 vi.mock("../../src/services/context-artifacts.js", () => ({
   loadConfig: vi.fn(async () => ({
@@ -94,7 +61,7 @@ vi.mock("../../src/services/context-artifacts.js", () => ({
   })),
   indexAllArtifacts: (...args: unknown[]) => mockIndexAllArtifacts(...(args as [string])),
   searchArtifacts: (...args: unknown[]) => mockSearchArtifacts(...(args as [string, string, number])),
-  ensureArtifactsIndexed: vi.fn(async () => ({ reindexed: [], upToDate: [], errors: [] })),
+  ensureArtifactsIndexed: (...args: unknown[]) => mockEnsureArtifactsIndexed(...(args as [string])),
   removeAllArtifacts: vi.fn(async () => {}),
 }));
 
@@ -106,87 +73,43 @@ import { handleContextTool } from "../../src/tools/context-tools.js";
 
 const TEST_PATH = "/tmp/test-project";
 
-describe("codebase_context_index — embedding provider readiness guard", () => {
+describe("context indexing and search ownership", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetCollectionInfo.mockResolvedValue(null);
   });
 
-  it("calls ensureOllamaReady when embeddingProvider is ollama", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "ollama",
-      embeddingModel: "test-model",
-    });
-
+  it("delegates explicit indexing to the context artifact service", async () => {
     await handleContextTool("codebase_context_index", {
       projectPath: TEST_PATH,
     });
 
-    expect(mockEnsureOllamaReady).toHaveBeenCalledOnce();
-    expect(mockGetEmbeddingProvider).not.toHaveBeenCalled();
+    expect(mockIndexAllArtifacts).toHaveBeenCalledOnce();
+    expect(mockIndexAllArtifacts).toHaveBeenCalledWith(TEST_PATH);
   });
 
-  it("calls getEmbeddingProvider (not ensureOllamaReady) when embeddingProvider is openai", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "openai",
-      embeddingModel: "text-embedding-3-small",
-    });
-
-    await handleContextTool("codebase_context_index", {
+  it("delegates first-search indexing and search to the context artifact service", async () => {
+    await handleContextTool("codebase_context_search", {
       projectPath: TEST_PATH,
+      query: "test query",
     });
 
-    expect(mockEnsureOllamaReady).not.toHaveBeenCalled();
-    expect(mockGetEmbeddingProvider).toHaveBeenCalledOnce();
-  });
-});
-
-describe("codebase_context_search — embedding provider readiness guard", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+    expect(mockIndexAllArtifacts).toHaveBeenCalledOnce();
+    expect(mockEnsureArtifactsIndexed).not.toHaveBeenCalled();
+    expect(mockSearchArtifacts).toHaveBeenCalledOnce();
   });
 
-  it("calls ensureOllamaReady when embeddingProvider is ollama", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "ollama",
-      embeddingModel: "test-model",
-    });
+  it("delegates staleness checks for an existing context collection", async () => {
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 1 });
 
     await handleContextTool("codebase_context_search", {
       projectPath: TEST_PATH,
       query: "test query",
     });
 
-    expect(mockEnsureOllamaReady).toHaveBeenCalledOnce();
-    expect(mockGetEmbeddingProvider).not.toHaveBeenCalled();
-  });
-
-  it("calls getEmbeddingProvider (not ensureOllamaReady) when embeddingProvider is openai", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "openai",
-      embeddingModel: "text-embedding-3-small",
-    });
-
-    await handleContextTool("codebase_context_search", {
-      projectPath: TEST_PATH,
-      query: "test query",
-    });
-
-    expect(mockEnsureOllamaReady).not.toHaveBeenCalled();
-    expect(mockGetEmbeddingProvider).toHaveBeenCalledOnce();
-  });
-
-  it("calls getEmbeddingProvider (not ensureOllamaReady) when embeddingProvider is google", async () => {
-    mockGetEmbeddingConfig.mockReturnValue({
-      embeddingProvider: "google",
-      embeddingModel: "gemini-embedding-001",
-    });
-
-    await handleContextTool("codebase_context_search", {
-      projectPath: TEST_PATH,
-      query: "test query",
-    });
-
-    expect(mockEnsureOllamaReady).not.toHaveBeenCalled();
-    expect(mockGetEmbeddingProvider).toHaveBeenCalledOnce();
+    expect(mockIndexAllArtifacts).not.toHaveBeenCalled();
+    expect(mockEnsureArtifactsIndexed).toHaveBeenCalledOnce();
+    expect(mockEnsureArtifactsIndexed).toHaveBeenCalledWith(TEST_PATH);
+    expect(mockSearchArtifacts).toHaveBeenCalledOnce();
   });
 });

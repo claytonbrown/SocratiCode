@@ -37,3 +37,51 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:unit
+
+  node-floor-consumer-install:
+    name: Node 18.17 Consumer Install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18.17.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Verify package installation at the declared Node floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer_dir="$(mktemp -d)"
+          npm pack --pack-destination "$consumer_dir"
+          package_file="$(find "$consumer_dir" -maxdepth 1 -type f -name 'socraticode-*.tgz' -print -quit)"
+          test -n "$package_file"
+          cd "$consumer_dir"
+          npm init --yes
+          npm install --engine-strict "$package_file"
+          test -f node_modules/socraticode/dist/index.js
+
+  # The one test that asks the compiler instead of asserting what we believe.
+  # It lives under tests/integration/ because it runs a real `cargo check`, and
+  # the unit job above does not reach it — so it gets a job of its own rather
+  # than being counted as covered while never running.
+  #
+  # It skips itself where cargo is absent, which is what makes this job's
+  # `rustc --version` step matter: without it a toolchain that quietly stopped
+  # being installed would turn the test into a silent no-op, and a silent no-op
+  # is how the two regressions this test exists to catch reached main in the
+  # first place.
+  rust-graph-vs-cargo:
+    name: Rust graph vs cargo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Fail if the Rust toolchain is missing
+        run: rustc --version && cargo --version
+      - run: npm ci
+      - run: npx vitest run tests/integration/rust-graph-vs-cargo.test.ts

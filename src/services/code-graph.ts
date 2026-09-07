@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Lang, registerDynamicLanguage } from "@ast-grep/napi";
 import { graphCollectionName, projectIdFromPath } from "../config.js";
 import { ELIXIR_TEMPLATE_EXTENSIONS, EXTENSION_LANGUAGE_MAP, EXTRA_EXTENSIONS, getLanguageFromExtension, MAX_GRAPH_FILE_BYTES, toForwardSlash } from "../constants.js";
@@ -15,11 +18,21 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
-import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
-import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotProjectRootForProject, findGodotRootForFile, type GodotUidIndex, parseGodotAutoloads, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import {
+  computeUnresolvedPct,
+  type GodotSymbolResolutionContext,
+  resolveCallSites,
+} from "./graph-symbol-resolution.js";
+import {
+  extractSymbolsAndCalls,
+  type RustUseBinding,
+  rawCallsToUnresolvedEdges,
+} from "./graph-symbols.js";
+
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { logger } from "./logger.js";
+import { setGdscriptParserAvailable } from "./parser-availability.js";
 import { deleteGraphData, describeQdrantError, getGraphMetadata, loadGraphData, saveGraphData } from "./qdrant.js";
 import {
   dropSymbolGraphCache,
@@ -28,15 +41,20 @@ import {
 } from "./symbol-graph-cache.js";
 import {
   allNameShardKeys,
+  cleanStaleGenerations,
   contentHashOf,
+  coordinateProject,
+  deleteGeneration,
   deleteSymbolGraphData,
   ensureSymbolGraphCollections,
   nameShardKey,
-  reverseShardKey,
+  registerStagingGeneration,
+  reverseShardKeyForCallee,
   saveFilePayloads,
   saveNameShard,
   saveReverseShard,
   saveSymbolGraphMeta,
+  unregisterStagingGeneration,
 } from "./symbol-graph-store.js";
 
 // Re-export analysis functions for external consumers
@@ -135,26 +153,30 @@ export async function getOrBuildGraph(
   projectPath: string,
   extraExtensions?: Set<string>,
 ): Promise<CodeGraph> {
+  const existing = await getExistingGraph(projectPath);
+  if (existing) return existing;
+
   const resolved = path.resolve(projectPath);
-  const cached = graphCache.get(resolved);
-  if (cached) {
-    return cached;
-  }
-
-  // Try loading persisted graph from Qdrant
-  const projectId = projectIdFromPath(resolved);
-  const graphCollName = graphCollectionName(projectId);
-  const persisted = await loadGraphData(graphCollName);
-  if (persisted) {
-    graphCache.set(resolved, persisted);
-    return persisted;
-  }
-
   const graph = await buildCodeGraph(resolved, extraExtensions);
   // Strip symbol fields when serving as a plain CodeGraph
   const plain: CodeGraph = { nodes: graph.nodes, edges: graph.edges };
   graphCache.set(resolved, plain);
   return plain;
+}
+
+/** Get a cached or persisted graph without creating one when it is absent. */
+export async function getExistingGraph(projectPath: string): Promise<CodeGraph | null> {
+  const resolved = path.resolve(projectPath);
+  const cached = graphCache.get(resolved);
+  if (cached) return cached;
+
+  const projectId = projectIdFromPath(resolved);
+  const graphCollName = graphCollectionName(projectId);
+  const persisted = await loadGraphData(graphCollName);
+  if (!persisted) return null;
+
+  graphCache.set(resolved, persisted);
+  return persisted;
 }
 
 /** Options for `rebuildGraph` controlling which layers are rebuilt. */
@@ -236,7 +258,23 @@ async function doRebuildGraph(
     if (!opts.skipSymbolGraph) {
       try {
         progress.phase = "resolving symbols";
-        resolveCallSites(graph, built.symbolsByFile, built.outgoingCallsByFile);
+        // Use the autoload table built by buildCodeGraph (per-project, merged
+        // from all Godot project roots) for GDScript receiver-type resolution.
+        resolveCallSites(
+          graph,
+          built.symbolsByFile,
+          built.outgoingCallsByFile,
+          built.rustBindingsByFile,
+          built.rustCrateRootByFile,
+          built.rustInlineScopedCalls,
+          built.rustInlineDeclaredSymbols,
+          built.rustCrateRootsByFile,
+          built.autoloadTable,
+          built.inferredTypesByFile,
+          built.memberAssignmentsByFile,
+          built.resToRepoPathMap,
+          built.godotContext,
+        );
 
         progress.phase = "persisting symbols";
         await persistSymbolGraph(projectId, resolvedPath, built.symbolsByFile, built.outgoingCallsByFile);
@@ -305,105 +343,135 @@ async function persistSymbolGraph(
   symbolsByFile: Map<string, SymbolNode[]>,
   outgoingCallsByFile: Map<string, SymbolEdge[]>,
 ): Promise<void> {
-  await ensureSymbolGraphCollections(projectId);
+  return coordinateProject(projectId, async () => {
+    await ensureSymbolGraphCollections(projectId);
 
-  // Build per-file payloads (need source bytes for contentHash).
-  const payloads: SymbolGraphFilePayload[] = [];
-  let totalSymbols = 0;
-  let totalEdges = 0;
-  for (const [relPath, symbols] of symbolsByFile.entries()) {
-    const outgoingCalls = outgoingCallsByFile.get(relPath) ?? [];
-    let language = "plaintext";
-    const firstNonModule = symbols.find((s) => s.name !== "<module>");
-    if (firstNonModule) language = firstNonModule.language;
-    else language = symbols[0]?.language ?? language;
+    // Build per-file payloads (need source bytes for contentHash).
+    const payloads: SymbolGraphFilePayload[] = [];
+    let totalSymbols = 0;
+    let totalEdges = 0;
+    for (const [relPath, symbols] of symbolsByFile.entries()) {
+      const outgoingCalls = outgoingCallsByFile.get(relPath) ?? [];
+      let language = "plaintext";
+      const firstNonModule = symbols.find((s) => s.name !== "<module>");
+      if (firstNonModule) language = firstNonModule.language;
+      else language = symbols[0]?.language ?? language;
 
-    let contentHash = "";
-    try {
-      const src = await fs.readFile(path.join(resolvedPath, relPath), "utf-8");
-      contentHash = contentHashOf(src);
-    } catch {
-      // ignore
+      let contentHash = "";
+      try {
+        const src = await fs.readFile(path.join(resolvedPath, relPath), "utf-8");
+        contentHash = contentHashOf(src);
+      } catch {
+        // ignore
+      }
+      payloads.push({
+        file: relPath, language, contentHash, symbols, outgoingCalls,
+      });
+      totalSymbols += symbols.filter((s) => s.name !== "<module>").length;
+      totalEdges += outgoingCalls.length;
     }
-    payloads.push({
-      file: relPath, language, contentHash, symbols, outgoingCalls,
-    });
-    totalSymbols += symbols.filter((s) => s.name !== "<module>").length;
-    totalEdges += outgoingCalls.length;
-  }
 
-  // Build sharded indices
-  const nameShards = new Map<string, Record<string, SymbolRef[]>>();
-  for (const key of allNameShardKeys()) nameShards.set(key, {});
-  for (const [file, symbols] of symbolsByFile.entries()) {
-    for (const sym of symbols) {
-      if (sym.name === "<module>") continue;
-      const shardKey = nameShardKey(sym.name);
-      const shard = nameShards.get(shardKey);
-      if (!shard) continue;
-      const ref: SymbolRef = { file, id: sym.id };
-      // Use hasOwn — `shard[sym.name]` would return Object.prototype.constructor
-      // (a function) for symbol names like "constructor" / "toString" / "hasOwnProperty".
-      const existing = Object.hasOwn(shard, sym.name) ? shard[sym.name] : undefined;
-      if (existing) existing.push(ref);
-      else shard[sym.name] = [ref];
+    // Build sharded indices
+    const nameShards = new Map<string, Record<string, SymbolRef[]>>();
+    for (const key of allNameShardKeys()) nameShards.set(key, {});
+    for (const [file, symbols] of symbolsByFile.entries()) {
+      for (const sym of symbols) {
+        if (sym.name === "<module>") continue;
+        const shardKey = nameShardKey(sym.name);
+        const shard = nameShards.get(shardKey);
+        if (!shard) continue;
+        const ref: SymbolRef = { file, id: sym.id };
+        // Use hasOwn — `shard[sym.name]` would return Object.prototype.constructor
+        // (a function) for symbol names like "constructor" / "toString" / "hasOwnProperty".
+        const existing = Object.hasOwn(shard, sym.name) ? shard[sym.name] : undefined;
+        if (existing) existing.push(ref);
+        else shard[sym.name] = [ref];
+      }
     }
-  }
 
-  const reverseShards = new Map<number, Record<string, string[]>>();
-  for (const [callerFile, edges] of outgoingCallsByFile.entries()) {
-    for (const e of edges) {
-      for (const calleeId of e.calleeCandidates) {
-        const calleeFile = calleeId.split("::")[0];
-        if (!calleeFile || calleeFile === callerFile) continue;
-        const bucket = reverseShardKey(calleeFile);
-        let shard = reverseShards.get(bucket);
-        if (!shard) {
-          shard = {};
-          reverseShards.set(bucket, shard);
-        }
-        const existing = shard[calleeFile];
-        if (existing) {
-          if (!existing.includes(callerFile)) existing.push(callerFile);
-        } else {
-          shard[calleeFile] = [callerFile];
+    const newGeneration = randomUUID();
+    registerStagingGeneration(projectId, newGeneration);
+
+    const reverseShardSets = new Map<number, Map<string, Set<string>>>();
+    for (const edges of outgoingCallsByFile.values()) {
+      for (const e of edges) {
+        for (const calleeId of e.calleeCandidates) {
+          const bucket = reverseShardKeyForCallee(calleeId);
+          let shard = reverseShardSets.get(bucket);
+          if (!shard) {
+            shard = new Map();
+            reverseShardSets.set(bucket, shard);
+          }
+          let callers = shard.get(calleeId);
+          if (!callers) {
+            callers = new Set();
+            shard.set(calleeId, callers);
+          }
+          callers.add(e.callerId);
         }
       }
     }
-  }
 
-  // Persist
-  await saveFilePayloads(projectId, payloads);
-  for (const [shardKey, shard] of nameShards.entries()) {
-    if (Object.keys(shard).length === 0) continue;
-    await saveNameShard(projectId, shardKey, shard);
-  }
-  for (const [bucket, shard] of reverseShards.entries()) {
-    if (Object.keys(shard).length === 0) continue;
-    await saveReverseShard(projectId, bucket, shard);
-  }
+    const reverseShards = new Map<number, Record<string, string[]>>();
+    for (const [bucket, shardSets] of reverseShardSets.entries()) {
+      const shard: Record<string, string[]> = {};
+      for (const [calleeId, callers] of shardSets.entries()) {
+        shard[calleeId] = Array.from(callers);
+      }
+      reverseShards.set(bucket, shard);
+    }
 
-  const meta: SymbolGraphMeta = {
-    projectId,
-    symbolCount: totalSymbols,
-    edgeCount: totalEdges,
-    fileCount: symbolsByFile.size,
-    unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
-    builtAt: Date.now(),
-    schemaVersion: 1,
-  };
-  await saveSymbolGraphMeta(projectId, meta);
+    try {
+      // Persist all payloads and shards into the staged generation first
+      await saveFilePayloads(projectId, payloads, newGeneration);
+      for (const [shardKey, shard] of nameShards.entries()) {
+        if (Object.keys(shard).length === 0) continue;
+        await saveNameShard(projectId, shardKey, shard, newGeneration);
+      }
+      for (const [bucket, shard] of reverseShards.entries()) {
+        if (Object.keys(shard).length === 0) continue;
+        await saveReverseShard(projectId, bucket, shard, newGeneration);
+      }
 
-  // Replace cache entry
-  const cache = new SymbolGraphCache(projectId, meta);
-  setSymbolGraphCache(cache);
+      // Activate that generation with one metadata-pointer write only after every staged write succeeds
+      const meta: SymbolGraphMeta = {
+        projectId,
+        symbolCount: totalSymbols,
+        edgeCount: totalEdges,
+        fileCount: symbolsByFile.size,
+        unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
+        builtAt: Date.now(),
+        schemaVersion: 2,
+        generation: newGeneration,
+      };
+      await saveSymbolGraphMeta(projectId, meta);
 
-  logger.info("Symbol graph persisted", {
-    projectId,
-    files: meta.fileCount,
-    symbols: meta.symbolCount,
-    edges: meta.edgeCount,
-    unresolvedPct: meta.unresolvedEdgePct.toFixed(1),
+      // Replace cache entry
+      const cache = new SymbolGraphCache(projectId, meta);
+      setSymbolGraphCache(cache);
+
+      // Safely retire superseded generations and clean abandoned staged generations
+      await cleanStaleGenerations(projectId, newGeneration).catch((err) => {
+        logger.warn("Failed to clean stale symbol-graph generations", {
+          projectId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+      logger.info("Symbol graph persisted", {
+        projectId,
+        files: meta.fileCount,
+        symbols: meta.symbolCount,
+        edges: meta.edgeCount,
+        unresolvedPct: meta.unresolvedEdgePct.toFixed(1),
+      });
+    } catch (err) {
+      // Staging failed: clean up the incomplete staged generation immediately
+      await deleteGeneration(projectId, newGeneration).catch(() => {});
+      throw err;
+    } finally {
+      unregisterStagingGeneration(projectId, newGeneration);
+    }
   });
 }
 
@@ -506,6 +574,13 @@ export async function getGraphStatus(projectPath: string): Promise<{
 // ── Register dynamic language grammars ───────────────────────────────────
 
 let dynamicLangsRegistered = false;
+/**
+ * The declaration map a path written inside an inline `mod { … }` block is
+ * answered with: empty, because the file's own declarations are not in that
+ * block's scope. Shared and never written.
+ */
+const EMPTY_DECLARED_MODS: Map<string, string> = new Map();
+
 const loadedDynamicLanguages = new Set<string>();
 const failedDynamicLanguages = new Map<string, string>();
 
@@ -532,74 +607,177 @@ export function getDynamicLanguageStatus(): DynamicLanguageStatus {
   };
 }
 
+/**
+ * Whether the GDScript tree-sitter parser was successfully registered.
+ * tree-sitter-gdscript ships platform-specific prebuilds; on platforms
+ * without a compatible artifact (e.g. linux-arm64) this stays false so
+ * callers can skip AST processing and use syntax-aware fallback extraction.
+ */
+export { gdscriptParserAvailable } from "./parser-availability.js";
+
+/**
+ * Preflight the tree-sitter-gdscript native addon in an isolated child
+ * process. This validates three things that a simple accessSync cannot:
+ *
+ *   1. The N-API addon loads (require does not throw).
+ *   2. It exposes a tree-sitter language object.
+ *   3. ast-grep can load its `tree_sitter_gdscript` symbol and parse a snippet.
+ *
+ * Running in a child process is essential because
+ * `registerDynamicLanguage` replaces all globally registered languages on
+ * each call — a failed registration in the parent would wipe out the
+ * other dynamic languages before we even try to batch them.
+ *
+ * The child resolves `node-gyp-build` from the tree-sitter-gdscript
+ * package's own context (via createRequire rooted at its package.json),
+ * so it does not rely on npm's hoisted node_modules layout.
+ *
+ * @param gdscriptPkgPath - Absolute path to tree-sitter-gdscript/package.json
+ * @returns The resolved native artifact path on success, null on failure.
+ */
+function preflightGdscriptAddon(gdscriptPkgPath: string): string | null {
+  const preflightScript = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "gdscript-preflight.cjs",
+  );
+  try {
+    const stdout = execFileSync(process.execPath, [preflightScript, gdscriptPkgPath], {
+      timeout: 10_000,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    // On success the preflight prints: "PREFLIGHT: OK <nativePath>"
+    const match = stdout.match(/^PREFLIGHT: OK (.+)$/m);
+    if (match) return match[1];
+    // If we get here, exit code was 0 but output was unexpected
+    logger.warn("GDScript preflight: unexpected output", { stdout });
+    return null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Extract stderr from the child process error
+    const stderr = (err as { stderr?: string })?.stderr?.trim() ?? message;
+    failedDynamicLanguages.set("gdscript", stderr);
+    logger.warn("GDScript preflight failed", { error: stderr });
+    return null;
+  }
+}
+
 export function ensureDynamicLanguages(): void {
   if (dynamicLangsRegistered) return;
-  dynamicLangsRegistered = true;
 
-  try {
-    const survivors: Record<string, AstGrepLangModule> = {};
+  const langPackages: Array<[string, string]> = [
+    ["python",  "@ast-grep/lang-python"],
+    ["go",      "@ast-grep/lang-go"],
+    ["java",    "@ast-grep/lang-java"],
+    ["rust",    "@ast-grep/lang-rust"],
+    ["c",       "@ast-grep/lang-c"],
+    ["cpp",     "@ast-grep/lang-cpp"],
+    ["csharp",  "@ast-grep/lang-csharp"],
+    ["ruby",    "@ast-grep/lang-ruby"],
+    ["kotlin",  "@ast-grep/lang-kotlin"],
+    ["swift",   "@ast-grep/lang-swift"],
+    ["scala",   "@ast-grep/lang-scala"],
+    ["bash",    "@ast-grep/lang-bash"],
+    ["php",     "@ast-grep/lang-php"],
+    ["lua",     "@ast-grep/lang-lua"],
+    ["dart",    "@ast-grep/lang-dart"],
+    ["elixir",  "@ast-grep/lang-elixir"],
+  ];
 
-    const langPackages: Array<[string, string]> = [
-      ["python",  "@ast-grep/lang-python"],
-      ["go",      "@ast-grep/lang-go"],
-      ["java",    "@ast-grep/lang-java"],
-      ["rust",    "@ast-grep/lang-rust"],
-      ["c",       "@ast-grep/lang-c"],
-      ["cpp",     "@ast-grep/lang-cpp"],
-      ["csharp",  "@ast-grep/lang-csharp"],
-      ["ruby",    "@ast-grep/lang-ruby"],
-      ["kotlin",  "@ast-grep/lang-kotlin"],
-      ["swift",   "@ast-grep/lang-swift"],
-      ["scala",   "@ast-grep/lang-scala"],
-      ["bash",    "@ast-grep/lang-bash"],
-      ["php",     "@ast-grep/lang-php"],
-      ["lua",     "@ast-grep/lang-lua"],
-      ["dart",    "@ast-grep/lang-dart"],
-      ["elixir",  "@ast-grep/lang-elixir"],
-    ];
+  // Phase 1: Pre-validate each @ast-grep/lang-* grammar individually.
+  // A throwing libraryPath getter is isolated to its own grammar so the
+  // rest can still be registered. We do NOT add to loadedDynamicLanguages
+  // yet — that happens only after the batch succeeds.
+  const survivors: Record<string, AstGrepLangModule> = {};
+  const pendingLoaded = new Set<string>();
 
-    for (const [name, pkg] of langPackages) {
-      try {
-        const mod = esmRequire(pkg) as AstGrepLangModule;
-        // Pre-validate the lazy `libraryPath` getter. `registerDynamicLanguage`
-        // accesses this property for every entry it receives, and a single
-        // throwing getter aborts the entire batch atomically (issue #43).
-        // Touching the getter here, inside the per-grammar try/catch, isolates
-        // a missing-prebuild failure to that one grammar so the rest can still
-        // be registered. The getter caches its result inside the package, so
-        // this is not duplicated work.
-        void mod.libraryPath;
-        survivors[name] = mod;
-        loadedDynamicLanguages.add(name);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        failedDynamicLanguages.set(name, message);
-        logger.warn("ast-grep grammar failed to load", { name, error: message });
-      }
+  for (const [name, pkg] of langPackages) {
+    try {
+      const mod = esmRequire(pkg) as AstGrepLangModule;
+      // Pre-validate the lazy `libraryPath` getter. registerDynamicLanguage
+      // accesses this property for every entry, and a single throwing
+      // getter aborts the entire batch atomically (issue #43).
+      void mod.libraryPath;
+      survivors[name] = mod;
+      pendingLoaded.add(name);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failedDynamicLanguages.set(name, message);
+      logger.warn("ast-grep grammar failed to load", { name, error: message });
     }
+  }
 
-    if (Object.keys(survivors).length > 0) {
+  // Phase 2: Preflight the GDScript native addon in an isolated child
+  // process. This validates the N-API addon loads, exports
+  // tree_sitter_gdscript, and ast-grep can parse with it — without
+  // risking the parent process's global language registry.
+  let gdscriptNativePath: string | null = null;
+  try {
+    const gdscriptPkgPath = esmRequire.resolve("tree-sitter-gdscript/package.json");
+    gdscriptNativePath = preflightGdscriptAddon(gdscriptPkgPath);
+    if (gdscriptNativePath) {
+      survivors.gdscript = {
+        libraryPath: gdscriptNativePath,
+        extensions: ["gd"],
+        languageSymbol: "tree_sitter_gdscript",
+      };
+      pendingLoaded.add("gdscript");
+    }
+    // If preflight returned null, the failure was already recorded in
+    // failedDynamicLanguages by preflightGdscriptAddon.
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    failedDynamicLanguages.set("gdscript", message);
+    logger.warn("ast-grep grammar failed to load", { name: "gdscript", error: message });
+  }
+
+  // Phase 3: Register all validated grammars in a single batch call.
+  // registerDynamicLanguage replaces all previously registered languages
+  // on each call, so every grammar must be in this one batch.
+  if (Object.keys(survivors).length > 0) {
+    try {
       registerDynamicLanguage(survivors);
+      // Batch succeeded — mark all survivors as loaded and clear any
+      // stale failure entries from a previous failed attempt.
+      for (const name of pendingLoaded) {
+        loadedDynamicLanguages.add(name);
+        failedDynamicLanguages.delete(name);
+      }
+      if (survivors.gdscript) {
+        setGdscriptParserAvailable(true);
+      }
       logger.info("Registered dynamic ast-grep languages", {
         languages: [...loadedDynamicLanguages].sort(),
       });
-    } else {
+    } catch (err) {
+      // Batch failed — every candidate in the batch is affected.
+      // Record failure for all pending languages and keep retry
+      // state accurate by NOT setting dynamicLangsRegistered.
+      const message = err instanceof Error ? err.message : String(err);
+      for (const name of pendingLoaded) {
+        failedDynamicLanguages.set(name, message);
+      }
       logger.warn(
-        "No dynamic ast-grep grammars loaded; PHP, Python, JVM and other dynamic languages will fall through to <module>-only extraction",
+        "Dynamic language batch registration failed; all candidates affected",
+        { error: message, candidates: [...pendingLoaded].sort() },
       );
+      // Do NOT set dynamicLangsRegistered — allow a retry on next call.
+      return;
     }
-    if (failedDynamicLanguages.size > 0) {
-      logger.warn(
-        "Some dynamic ast-grep grammars failed to load; affected languages will produce only <module>-level symbols",
-        { failed: [...failedDynamicLanguages.keys()].sort() },
-      );
-    }
-  } catch (err) {
-    // Should be unreachable now that each grammar is validated independently,
-    // but keep the outer guard so an unexpected throw cannot take the indexer
-    // process down.
-    logger.warn("Unexpected error in ensureDynamicLanguages", { error: String(err) });
+  } else {
+    logger.warn(
+      "No dynamic ast-grep grammars loaded; PHP, Python, JVM and other dynamic languages will fall through to <module>-only extraction",
+    );
   }
+
+  if (failedDynamicLanguages.size > 0) {
+    logger.warn(
+      "Some dynamic ast-grep grammars failed to load; affected languages will produce only <module>-level symbols",
+      { failed: [...failedDynamicLanguages.keys()].sort() },
+    );
+  }
+
+  dynamicLangsRegistered = true;
 }
 
 // ── Language mapping for ast-grep ────────────────────────────────────────
@@ -623,6 +801,7 @@ const EXTENSION_TO_AST_GREP_LANG: Record<string, Lang | string> = {
   ".ex": "elixir", ".exs": "elixir",
   ".lua": "lua",
   ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+  ".gd": "gdscript",
   // Composite languages (parsed via HTML + script re-parse)
   ".svelte": "svelte",
   ".vue": "vue",
@@ -719,7 +898,14 @@ export async function getGraphableFiles(
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         // Mixed Elixir templates use dedicated parsers, not the Elixir grammar.
-        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext)) {
+        // Godot resource files (.tscn/.tres) have no AST grammar but use tokenizer-based
+        // import extraction for [ext_resource] declarations.
+        const isGodotResource = ext === ".tscn" || ext === ".tres";
+        // .uid sidecar files contain UID strings for Godot's uid:// path
+        // resolution. They are not graph nodes themselves, but they must
+        // be in the file set so buildGodotUidIndexes can read them.
+        const isGodotUid = ext === ".uid";
+        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext) || isGodotResource || isGodotUid) {
           files.push(relPath);
         } else if (ext === "" && (includeDotFiles || !entry.name.startsWith("."))) {
           // Extensionless: admit only when detection yields a grammar-bearing
@@ -758,6 +944,29 @@ export async function buildCodeGraph(
 ): Promise<CodeGraph & {
   symbolsByFile: Map<string, SymbolNode[]>;
   outgoingCallsByFile: Map<string, SymbolEdge[]>;
+  autoloadTable?: Map<string, string>;
+  resToRepoPathMap: Map<string, string>;
+  godotContext?: GodotSymbolResolutionContext;
+  inferredTypesByFile: Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>;
+  memberAssignmentsByFile: Map<string, Array<{ receiver: string; memberName: string; valueType: string }>>;
+  /** Rust `use` bindings per file — resolution input only, never persisted. */
+  rustBindingsByFile: Map<string, RustUseBinding[]>;
+  /** Rust file → its crate's directory prefix. Resolution input only. */
+  rustCrateRootByFile: Map<string, string>;
+  /** Rust file → every target root its parsed Cargo manifest declares. */
+  rustCrateRootsByFile: Map<string, string[]>;
+  /**
+   * The call edges whose qualifier is rooted in an inline `mod` — a scope with
+   * no file to name. Resolution leaves them unresolved. Held by identity, so
+   * nothing about it reaches an edge or the store.
+   */
+  rustInlineScopedCalls: Set<SymbolEdge>;
+  /**
+   * The ids of the Rust symbols declared inside an inline `mod`. A path
+   * anchored at a file's own module cannot reach them, so resolution drops
+   * them from that path's candidates. Resolution input only, never persisted.
+   */
+  rustInlineDeclaredSymbols: Map<string, string>;
 }> {
   ensureDynamicLanguages();
 
@@ -767,6 +976,63 @@ export async function buildCodeGraph(
   const fileSet = new Set(files);
   if (files.some((file) => isElixirTemplateExtension(path.extname(file)))) {
     await ensureElixirTemplateParsers();
+  }
+
+  // Build GDScript class_name index once for O(1) extends resolution.
+  // Scans all .gd files in a single pass; avoids 68k+ redundant reads for
+  // large Godot projects where every file has an extends statement.
+  // Per-Godot-project: each project.godot root gets its own class_name index
+  // so class names in one Godot project don't leak into another.
+  const hasGdscript = files.some((f) => f.endsWith(".gd"));
+  const hasGodotFiles = hasGdscript || files.some((f) => f.endsWith(".tscn") || f.endsWith(".tres"));
+  const godotRootCache = new Map<string, string | null>();
+  // Per-project Godot indexes: maps each Godot project root to its scoped
+  // class_name index. Used for per-file res:// and extends resolution.
+  const godotProjectIndexes = hasGodotFiles
+    ? buildGodotProjectIndexes(resolvedPath, fileSet, godotRootCache)
+    : undefined;
+  // Per-project UID indexes: maps each Godot project root to its scoped
+  // uid:// → relative path index. Used for uid:// resolution in GDScript
+  // and Godot resource files. Godot prefers UIDs over text paths.
+  const godotProjectUidIndexes = hasGodotFiles
+    ? buildGodotUidIndexes(resolvedPath, fileSet, godotRootCache)
+    : undefined;
+
+  // Symbol resolution needs the same nearest-project boundary as import
+  // resolution. Keep each project's class names, autoloads, and res:// root
+  // isolated so duplicate names in sibling or nested projects cannot cross.
+  let godotContext: GodotSymbolResolutionContext | undefined;
+  if (hasGodotFiles) {
+    const projectRootByFile = new Map<string, string>();
+    for (const relPath of files) {
+      if (!relPath.endsWith(".gd") && !relPath.endsWith(".tscn") && !relPath.endsWith(".tres")) {
+        continue;
+      }
+      const root = findGodotRootForFile(
+        path.join(resolvedPath, relPath),
+        godotProjectIndexes,
+        godotRootCache,
+      );
+      if (root) projectRootByFile.set(relPath, root);
+    }
+
+    const projectsByRoot = new Map<string, {
+      rootOffset: string;
+      classNameIndex: ReadonlyMap<string, string>;
+      autoloadTable: ReadonlyMap<string, string>;
+    }>();
+    for (const [godotRoot, classNameIndex] of godotProjectIndexes ?? []) {
+      const rootOffset = toForwardSlash(path.relative(resolvedPath, godotRoot));
+      const autoloadTable = new Map<string, string>();
+      for (const [name, resourcePath] of parseGodotAutoloads(godotRoot)) {
+        const repoPath = rootOffset ? `${rootOffset}/${resourcePath}` : resourcePath;
+        autoloadTable.set(name, repoPath);
+      }
+      projectsByRoot.set(godotRoot, { rootOffset, classNameIndex, autoloadTable });
+    }
+    if (projectsByRoot.size > 0) {
+      godotContext = { projectRootByFile, projectsByRoot };
+    }
   }
 
   if (progress) {
@@ -780,6 +1046,11 @@ export async function buildCodeGraph(
   const edges: CodeGraphEdge[] = [];
   const symbolsByFile = new Map<string, SymbolNode[]>();
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
+  const inferredTypesByFile = new Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>();
+  const memberAssignmentsByFile = new Map<string, Array<{ receiver: string; memberName: string; valueType: string }>>();
+  const rustBindingsByFile = new Map<string, RustUseBinding[]>();
+  const rustInlineScopedCalls = new Set<SymbolEdge>();
+  const rustInlineDeclaredSymbols = new Map<string, string>();
 
   // Per-reason counts, holding only the reasons that actually fired — the build log
   // emits `skipReasons` straight from this map, so it never carries a zero.
@@ -881,6 +1152,47 @@ export async function buildCodeGraph(
   const hasElixir = files.some((f) => [".ex", ".exs"].includes(path.extname(f).toLowerCase()));
   const elixirModuleMap = hasElixir ? buildElixirModuleMap(fileSet, resolvedPath) : undefined;
 
+  // Record every crate the tree declares, from each Cargo.toml (discovered by
+  // walking, like go.mod and pubspec.yaml — Cargo.toml is never in the
+  // graphable file set). A Rust path names a position in a module tree
+  // (`crate::`, `super::`) or another crate by name, neither of which the
+  // resolver could follow without knowing where each crate's root module sits:
+  // every specifier containing `::` resolved to null, so the file graph held
+  // only bare `mod` declarations. An empty list keeps `mod`, `super` and `self`
+  // resolving from the file's own position, as before.
+  const hasRust = files.some((f) => path.extname(f).toLowerCase() === ".rs");
+  const rustCrates = hasRust ? buildRustCrateMap(fileSet, resolvedPath) : undefined;
+
+  // Which crate each Rust file belongs to, as a path prefix. `crate::` is
+  // relative to a crate's own root module, so resolution needs the boundary —
+  // and the manifests are what draw it. Deriving it from the path instead
+  // means guessing at a layout: a marker like `src/` misses a crate that has
+  // no `src/` directory (ripgrep) and misreads one whose sources start at the
+  // project root (tokio), and the guess fails silently in both.
+  //
+  // The owning crate is the one whose directory contains the file and is
+  // deepest, with the workspace root at `"."` ranking as no depth at all —
+  // the same rule the import resolver settled on. A crate at the root confines
+  // nothing, which is correct: there is only one crate to be in.
+  const rustCrateRootByFile = new Map<string, string>();
+  const rustCrateRootsByFile = new Map<string, string[]>();
+  if (rustCrates && rustCrates.length > 0) {
+    const depthOf = (crate: { dir: string }): number => (crate.dir === "." ? 0 : crate.dir.length);
+    const ranked = [...rustCrates].sort((a, b) => depthOf(b) - depthOf(a));
+    for (const relPath of files) {
+      if (!relPath.endsWith(".rs")) continue;
+      const owner = ranked.find((c) => c.dir === "." || relPath.startsWith(`${c.dir}/`));
+      if (owner) {
+        rustCrateRootByFile.set(relPath, owner.dir === "." ? "" : `${owner.dir}/`);
+        // Only a parsed manifest is complete enough to make absence a verdict.
+        // An unreadable manifest contributes convention roots for import
+        // recovery, but those roots must not hide a custom target it could not
+        // declare to us.
+        if (!owner.manifestUnread) rustCrateRootsByFile.set(relPath, [...owner.roots]);
+      }
+    }
+  }
+
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
     let lang = getAstGrepLang(ext);
@@ -903,10 +1215,28 @@ export async function buildCodeGraph(
       lang = detectedLang;
     }
 
+    // .uid sidecar files are in the file set for UID index building but
+    // are not graph nodes — they contain no code, just a UID string.
+    if (ext === ".uid") {
+      if (progress) progress.filesProcessed++;
+      continue;
+    }
+
     // Extra extensions with no parser are included as leaf nodes so they can be
-    // targets of import edges, but we skip
-    // import extraction since we can't parse them.
-    if (!lang && !isElixirTemplate) {
+    // targets of import edges, but we skip import extraction since we can't
+    // parse them. Godot resource files (.tscn/.tres) are an exception: they
+    // have no AST grammar but use tokenizer-based import extraction for
+    // [ext_resource] declarations, so they pass through to
+    // the extraction path below.
+    const isGodotResource = ext === ".tscn" || ext === ".tres";
+    const isGodotUid = ext === ".uid";
+    // Sidecars stay in fileSet so the UID index can read them, but they are
+    // metadata rather than graph nodes and never enter the source-read path.
+    if (isGodotUid) {
+      if (progress) progress.filesProcessed++;
+      continue;
+    }
+    if (!lang && !isElixirTemplate && !isGodotResource) {
       const absolutePath = path.join(resolvedPath, relPath);
       if (!nodesMap.has(relPath)) {
         nodesMap.set(relPath, {
@@ -981,14 +1311,37 @@ export async function buildCodeGraph(
     // as plaintext.
     node.language = language;
 
-    const extractionLang = lang ?? "elixir-template";
+    const extractionLang = lang ?? (isGodotResource ? "godot-resource" : "elixir-template");
     const importInfos = extractImports(source, extractionLang, ext);
 
     // Extract symbols & raw call sites in the same pass
     try {
       const extracted = extractSymbolsAndCalls(source, extractionLang, ext, relPath);
       symbolsByFile.set(relPath, extracted.symbols);
-      outgoingCallsByFile.set(relPath, rawCallsToUnresolvedEdges(extracted.rawCalls));
+      const edges = rawCallsToUnresolvedEdges(extracted.rawCalls);
+      outgoingCallsByFile.set(relPath, edges);
+      // One edge per raw call, in order, so the call at `i` is the edge at `i`.
+      // The flag stays out of the edge itself: it is resolution's business and
+      // the store must not grow a field for it.
+      for (let i = 0; i < extracted.rawCalls.length; i++) {
+        if (extracted.rawCalls[i].qualifierRootedInInlineMod) rustInlineScopedCalls.add(edges[i]);
+      }
+      // Same reason, one level down: which declarations sit inside an inline
+      // `mod` is visible in the extractor and nowhere after it.
+      if (extracted.inlineModSymbolIds) {
+        for (const [id, owner] of extracted.inlineModSymbolIds) {
+          rustInlineDeclaredSymbols.set(id, owner);
+        }
+      }
+      if (extracted.bindings && extracted.bindings.length > 0) {
+        rustBindingsByFile.set(relPath, extracted.bindings);
+      }
+      if (extracted.inferredTypes && extracted.inferredTypes.size > 0) {
+        inferredTypesByFile.set(relPath, extracted.inferredTypes);
+      }
+      if (extracted.memberAssignments && extracted.memberAssignments.length > 0) {
+        memberAssignmentsByFile.set(relPath, extracted.memberAssignments);
+      }
     } catch (err) {
       logger.debug("Symbol extraction failed (continuing)", {
         file: relPath,
@@ -996,13 +1349,76 @@ export async function buildCodeGraph(
       });
     }
 
+    // Which modules this file brings into the tree by declaring them. A Rust
+    // path with an unanchored head can only reach a module the file declares,
+    // and the declaration is the only evidence of that in the source: matching
+    // a neighbouring file by name instead let a third-party head capture the
+    // import whenever a file of that name happened to exist.
+    //
+    // The name comes from the declaration itself and not from its specifier.
+    // Reading the specifier's last segment got both ends wrong: a
+    // `#[path = "custom.rs"] mod foo;` recorded `custom.rs` and lost every
+    // `use foo::Item;` in that file, and a `mod bar;` written inside
+    // `mod outer { … }` recorded `bar` as if the file declared it — which
+    // handed a same-named neighbouring file back the capture this gate exists
+    // to stop. Both checked with cargo 1.70.0 and 1.98.0: the attribute form
+    // compiles with `foo` in scope, and at the file's own level a name
+    // declared inside an inline block reaches the dependency instead, or
+    // fails with E0432 when there is none.
+    // The map carries the file with the name, because half the declarations
+    // move it: `#[path = "custom.rs"] mod foo;` names `foo` and files it at
+    // `custom.rs`, and a resolver holding only the name looks for `src/foo.rs`,
+    // finds nothing, and falls through to a library called `foo` if the
+    // workspace has one — an edge into an unrelated crate. Where the
+    // declaration does not move anything, the value is the name itself.
+    const declaredMods = new Map<string, string>();
+    for (const imp of importInfos) {
+      if (imp.declaredName) declaredMods.set(imp.declaredName, imp.moduleSpecifier);
+    }
+
+    // Per-file Godot project root and scoped class_name index.
+    // Computed once per file, outside the import loop, since the root
+    // does not change between imports from the same file.
+    // Each Godot source file resolves res:// and extends relative to its
+    // nearest project.godot ancestor, with class_name lookups scoped to
+    // that same project. This supports repos with multiple Godot projects.
+    // When per-project indexes are available but a file has no project.godot
+    // ancestor, both root and index are null/undefined — class_name and
+    // res:// resolution are skipped for that file, matching Godot's
+    // project-scoped semantics.
+    // Non-Godot files skip this lookup entirely (the parameters are ignored
+    // by their resolveImport case) to avoid unnecessary filesystem walks.
+    let fileGodotRoot: string | null | undefined;
+    let fileClassNameIndex: ClassNameIndex | undefined;
+    let fileUidIndex: GodotUidIndex | undefined;
+    const isGodotFile = language === "gdscript" || language === "godot-resource";
+    if (godotProjectIndexes && isGodotFile) {
+      fileGodotRoot = findGodotRootForFile(absolutePath, godotProjectIndexes, godotRootCache);
+      if (fileGodotRoot) {
+        fileClassNameIndex = godotProjectIndexes.get(fileGodotRoot);
+        fileUidIndex = godotProjectUidIndexes?.get(fileGodotRoot);
+      }
+      // fileClassNameIndex stays undefined when no project root is found,
+      // preventing cross-project class_name leakage.
+    }
+    // Non-Godot files or projects without Godot indexes: fileClassNameIndex
+    // and fileGodotRoot stay undefined — resolveImport ignores them.
+
     for (const imp of importInfos) {
       node.imports.push(imp.moduleSpecifier);
 
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap);
+      // A bare path written inside an inline `mod { … }` block is answered
+      // without the file's declarations: they are not in that block's scope,
+      // and handing them over drew an edge rustc rejects with E0432. The map is
+      // emptied rather than omitted — omitting it turns the gate off entirely,
+      // which is the looser reading, not a stricter one. Edition 2015 is
+      // unaffected: there the path is absolute from the crate root and never
+      // consulted the map to begin with.
+      const scopedMods = imp.fromInlineBlock ? EMPTY_DECLARED_MODS : declaredMods;
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true, fileClassNameIndex, fileGodotRoot, fileUidIndex, imp.fallbackSpecifier, imp.godotImportKind);
       if (resolved) {
         node.dependencies.push(resolved);
 
@@ -1042,10 +1458,54 @@ export async function buildCodeGraph(
     ...(skipsByReason.size > 0 ? { skipReasons: Object.fromEntries(skipsByReason) } : {}),
   });
 
+  // Preserve the single-project fields introduced with GDScript symbol
+  // resolution for direct callers. Multi-project builds deliberately leave
+  // them empty: no unscoped map can represent duplicate autoload names or
+  // duplicate res:// paths safely, and `godotContext` carries the complete
+  // caller-scoped representation used by the production resolver.
+  let autoloadTable: Map<string, string> | undefined;
+  const resToRepoPathMap = new Map<string, string>();
+  if (godotContext?.projectsByRoot.size === 1) {
+    const [godotRoot, project] = godotContext.projectsByRoot.entries().next().value as [
+      string,
+      { rootOffset: string; autoloadTable: ReadonlyMap<string, string> },
+    ];
+    autoloadTable = new Map(project.autoloadTable);
+    const prefix = project.rootOffset ? `${project.rootOffset}/` : "";
+    for (const [repoPath, ownerRoot] of godotContext.projectRootByFile) {
+      if (ownerRoot !== godotRoot) continue;
+      const resourcePath = prefix && repoPath.startsWith(prefix)
+        ? repoPath.slice(prefix.length)
+        : repoPath;
+      resToRepoPathMap.set(resourcePath, repoPath);
+    }
+  } else if (!godotContext) {
+    const godotRoot = findGodotProjectRootForProject(resolvedPath);
+    if (godotRoot) {
+      const rootOffset = toForwardSlash(path.relative(resolvedPath, godotRoot));
+      autoloadTable = new Map();
+      for (const [name, resourcePath] of parseGodotAutoloads(godotRoot)) {
+        const repoPath = rootOffset ? `${rootOffset}/${resourcePath}` : resourcePath;
+        autoloadTable.set(name, repoPath);
+        resToRepoPathMap.set(resourcePath, repoPath);
+      }
+    }
+  }
+
   return {
     nodes: Array.from(nodesMap.values()),
     edges,
     symbolsByFile,
     outgoingCallsByFile,
+    autoloadTable,
+    resToRepoPathMap,
+    godotContext,
+    inferredTypesByFile,
+    memberAssignmentsByFile,
+    rustBindingsByFile,
+    rustCrateRootByFile,
+    rustCrateRootsByFile,
+    rustInlineScopedCalls,
+    rustInlineDeclaredSymbols,
   };
 }

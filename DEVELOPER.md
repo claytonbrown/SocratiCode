@@ -168,7 +168,7 @@ npm run release:dry
 This will automatically:
 1. Determine the version bump from your commits
 2. Update `CHANGELOG.md` with all `feat:`, `fix:`, etc. entries
-3. Bump the version in `package.json`
+3. Bump the version in `package.json`, plugin manifests, Gemini extension manifest, and VS Code extension package files
 4. Create a git commit and tag (`v1.1.0`)
 5. Push to GitHub and create a GitHub Release
 
@@ -178,7 +178,7 @@ This will automatically:
 
 ```
 src/
-├── index.ts                 # MCP server entry point — registers all 21 tools
+├── index.ts                 # MCP server entry point; registers all SocratiCode tools
 ├── config.ts                # Project ID generation (SHA-256), collection naming, linked projects, branch detection
 ├── constants.ts             # All constants: ports, container names, models, chunk sizes, extensions
 ├── types.ts                 # TypeScript interfaces and types
@@ -196,7 +196,7 @@ src/
 │   ├── code-graph.ts        # AST-based code graph building via ast-grep
 │   ├── graph-analysis.ts    # Graph queries: dependencies, stats, cycles, Mermaid diagrams
 │   ├── graph-aliases.ts     # Path alias resolution from tsconfig/jsconfig compilerOptions.paths
-│   ├── graph-imports.ts     # Import/require/use extraction for 18+ languages via AST
+│   ├── graph-imports.ts     # Import/require/use extraction for 19+ languages via AST
 │   ├── graph-resolution.ts  # Module specifier → file path resolution (incl. aliases, SCSS partials)
 │   ├── graph-symbols.ts     # Per-language symbol & call-site extraction (Impact Analysis)
 │   ├── graph-symbol-resolution.ts  # Three-tier cross-file call-site resolution
@@ -218,9 +218,9 @@ tests/
 ├── helpers/
 │   ├── fixtures.ts          # Test fixture utilities (temp projects, Docker checks)
 │   └── setup.ts             # Integration test infrastructure (Qdrant client, cleanup)
-├── unit/                    # 608 tests — no Docker required
-├── integration/             # 137 tests — requires Docker
-└── e2e/                     # 20 tests — full lifecycle
+├── unit/                    # No Docker required
+├── integration/             # Requires Docker
+└── e2e/                     # Full lifecycle
 
 docker-compose.yml           # Alternative way to run infrastructure
 vitest.config.ts             # Test framework configuration
@@ -249,6 +249,8 @@ All constants are defined in `src/constants.ts`:
 | `OLLAMA_CONTAINER_NAME` | `socraticode-ollama` | Docker container name |
 | `OLLAMA_IMAGE` | `ollama/ollama:latest` | Docker image |
 
+`getWatcherMode()` resolves `SOCRATICODE_WATCHER=auto|manual|off` at call time and rejects unknown values. `src/index.ts` invokes it during startup so invalid lifecycle configuration fails before tools are accepted.
+
 > **Note**: `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, and `EMBEDDING_CONTEXT_LENGTH` are defined in `src/services/embedding-config.ts`, not in `src/constants.ts`. Defaults are `nomic-embed-text` / `768` for Ollama, `text-embedding-3-small` / `1536` for OpenAI, and `gemini-embedding-001` / `3072` for Google.
 
 ### Embedding batch size
@@ -261,7 +263,7 @@ Defined in `src/services/watcher.ts`: file changes are debounced for **2000ms** 
 
 ### Maximum file size
 
-Defined in `src/constants.ts` as `MAX_FILE_BYTES`: files larger than **5 MB** are skipped (configurable via `MAX_FILE_SIZE_MB` env var).
+Defined in `src/constants.ts` as `MAX_FILE_BYTES`: files larger than **5 MB** are skipped (configurable via `MAX_FILE_SIZE_MB` env var). The value is parsed as a complete finite number, so partial values such as `5MB` are rejected rather than silently truncated.
 
 ### Qdrant health check
 
@@ -292,7 +294,7 @@ When `SOCRATICODE_BRANCH_AWARE=true`, the current git branch is detected via `gi
 
 `loadLinkedProjects()` reads `.socraticode.json` and `SOCRATICODE_LINKED_PROJECTS` env var. `resolveLinkedCollections()` maps linked paths to `{ name, label }` descriptors for `searchMultipleCollections()`. The current project is always first (highest dedup priority).
 
-### Supported File Extensions (55)
+### Supported File Extensions (63)
 
 | Category | Extensions |
 |----------|-----------|
@@ -312,9 +314,12 @@ When `SOCRATICODE_BRANCH_AWARE=true`, the current git branch is detected via `gi
 | Documentation | `.md`, `.mdx`, `.rst`, `.txt` |
 | SQL | `.sql` |
 | Dart | `.dart` |
+| Elixir | `.ex`, `.exs`, `.heex`, `.eex`, `.leex` |
 | Lua | `.lua` |
 | R | `.r`, `.R` |
 | Docker | `.dockerfile` |
+| GDScript (Godot) | `.gd` |
+| Godot Resources | `.tscn`, `.tres` |
 
 Special files always indexed: `Dockerfile`, `Makefile`, `Rakefile`, `Gemfile`, `Procfile`, `.env.example`, `.gitignore`, `.dockerignore`.
 
@@ -342,20 +347,26 @@ When `codebase_index` is called:
    ├── Check for nomic-embed-text model
    └── Pull model if missing
 
-2. FILE DISCOVERY
+2. EFFECTIVE PROFILE RESOLUTION
+   ├── Load the collection's versioned effective index profile
+   ├── Infer released legacy defaults when existing metadata has no profile
+   ├── Keep requested changes pending for a collection that already has vectors
+   └── Use requested settings only when no collection profile remains; an empty profiled collection still keeps its profile
+
+3. FILE DISCOVERY
    getIndexableFiles(projectPath, extraExts?)
    ├── glob("**/*") to enumerate all files
    ├── Build ignore filter: defaults + .gitignore + .socraticodeignore
    ├── Filter by supported extension, special filename, or extra extensions
    └── Filter out ignored paths
 
-3. COLLECTION SETUP
+4. COLLECTION SETUP
    ensureCollection(collectionName)
    ├── Check if collection exists
    ├── Create with: provider-dependent dimensions (768/1536/3072), cosine distance, on-disk payload
    └── Create payload indexes: filePath, relativePath, language, contentHash
 
-4. FILE SCANNING & CHUNKING (parallel batches of 50 files)
+5. FILE SCANNING & CHUNKING (parallel batches of 50 files)
    ├── Read file content (skip if > 5 MB or unreadable)
    ├── Hash content: SHA-256 → 16-char prefix
    ├── Skip if hash matches existing (re-index mode)
@@ -371,7 +382,7 @@ When `codebase_index` is called:
    ├── Generate chunk ID: SHA-256 of "filePath:startLine" formatted as UUID
    └── Detect language from file extension
 
-5. BATCHED EMBEDDING + UPSERT (50 files per batch)
+6. BATCHED EMBEDDING + UPSERT (50 files per batch)
    For each batch of files:
    ├── Prepare text: "{documentPrefix}{relativePath}\n{content}" (prefix defaults to "search_document: ", see EMBEDDING_DOCUMENT_PREFIX; the path is dropped when EMBEDDING_DOCUMENT_INCLUDE_PATH=false)
    ├── Generate embeddings via configured provider (further batched internally)
@@ -380,7 +391,7 @@ When `codebase_index` is called:
    ├── Checkpoint: persist hashes to Qdrant (progress survives crashes)
    └── Check for cancellation request before next batch
 
-6. POST-INDEX
+7. POST-INDEX
    ├── Save final metadata (status: "completed")
    ├── Auto-build code dependency graph (non-fatal on failure)
    └── Auto-index context artifacts if config exists (non-fatal on failure)
@@ -394,8 +405,9 @@ When `codebase_search` is called:
 
 ```
 1. Generate query embedding
-   ├── Prepare text: "search_query: {query}" (default; see EMBEDDING_QUERY_PREFIX)
-   └── Send to configured embedding provider → provider-dependent vector (768 / 1536 / 3072 dims)
+   ├── Load the collection's effective query and embedding profile
+   ├── Prepare text with that profile's query prefix
+   └── Send to that profile's provider and model
 
 2. HYBRID SEARCH (dense + BM25, RRF-fused)
    ├── Build two parallel prefetch sub-queries:
@@ -418,6 +430,16 @@ The `nomic-embed-text` model uses task-specific prefixes for asymmetric retrieva
 This asymmetric encoding significantly improves retrieval quality.
 
 These are the defaults, kept for backward compatibility. Override them with `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_DOCUMENT_PREFIX` to match a different model's expected prefixes (e.g. `query: ` / `passage: ` for `multilingual-e5-*`, none for `bge-m3`). See the README's environment variable table for the full details.
+
+### Effective Index Profiles
+
+Each code collection and context collection stores a versioned effective profile. It records the query and document prefixes, document-path inclusion, chunk cap, embedding provider, model, dimensions, effective context length, LiteLLM dimensions flag, and format version. Code profiles also record the extension-language map and maximum file size.
+
+An existing collection always uses its effective profile for incremental updates, watcher events, and search. Requested differences are status-only pending changes. Removing and freshly indexing the collection records the requested profile. A legacy collection without profile metadata adopts the released prefix, path, and chunk defaults without rewriting vectors; unavailable historical embedding and code-scanning values are marked `legacy-unverified`.
+
+Linked search computes one query vector per compatible verified effective query profile. Legacy-unverified embedding identities are never grouped across collections.
+
+Context artifact states also store a configuration signature covering the configured path, resolved path, and description. A signature change replaces that artifact's vectors and payloads even when its content hash is unchanged.
 
 ---
 
@@ -491,6 +513,7 @@ When `codebase_graph_build` is called:
    │   ├── Swift: import
    │   ├── Bash: source, . (dot)
    │   ├── Dart/Lua: regex-based extraction
+   │   ├── GDScript: preload()/load() (res://, uid://, relative paths), extends ClassName, extends "res://path.gd", extends "relative.gd"
    │   ├── Svelte/Vue: HTML parse → <script> extraction → re-parse as TypeScript
    │   ├── Svelte/Vue: HTML parse → <style> extraction → CSS @import/@require regex
    │   └── CSS/SCSS/SASS/LESS: @import/@import url()/@require regex extraction
@@ -559,7 +582,7 @@ Uses depth-first search (DFS) with a recursion stack to find cycles in the direc
 
 ## Testing
 
-SocratiCode uses **vitest** as its test framework with **765 tests** across three layers.
+SocratiCode uses **vitest** as its test framework across three layers.
 
 ### Running Tests
 
@@ -585,11 +608,11 @@ npm run test:coverage
 
 ### Test Architecture
 
-| Layer | Directory | Tests | Docker | Description |
-|-------|-----------|-------|--------|-------------|
-| Unit | `tests/unit/` | 608 | No | Pure logic: config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, startup lifecycle |
-| Integration | `tests/integration/` | 137 | Yes | Real Docker containers: Qdrant CRUD, real Ollama embeddings, indexer, watcher, code graph, all 21 MCP tools |
-| E2E | `tests/e2e/` | 20 | Yes | Full lifecycle: health check → index → search → graph build/query/stats → watch → remove |
+| Layer | Directory | Docker | Description |
+|-------|-----------|--------|-------------|
+| Unit | `tests/unit/` | No | Pure logic: config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, startup lifecycle |
+| Integration | `tests/integration/` | Yes | Real Docker containers: Qdrant CRUD, real Ollama embeddings, indexer, watcher, code graph, all MCP tools |
+| E2E | `tests/e2e/` | Yes | Full lifecycle: health check → index → search → graph build/query/stats → watch → remove |
 
 ### Test Infrastructure
 
@@ -780,9 +803,9 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given — batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
-| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query: ` (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
-| `prepareDocumentText` | `(content, filePath) → string` | Build the text to embed: `search_document: ` prefix, then the relative path, then the content (prefix env-configurable via `EMBEDDING_DOCUMENT_PREFIX`; the path is dropped when `EMBEDDING_DOCUMENT_INCLUDE_PATH=false`) |
+| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given; batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
+| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query:` followed by a space (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
+| `prepareDocumentText` | `(content, filePath, profile?) → string` | Build the text to embed. `profile.documentPrefix` controls the prefix and `profile.documentIncludesPath` controls whether the file path precedes the content; omitting the profile uses the requested runtime settings. |
 
 ### indexer.ts
 
@@ -806,17 +829,22 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 | `updateProjectIndex` | `(projectPath, onProgress?, extraExtensions?) → Promise<{ added, updated, removed, chunksCreated, cancelled }>` | Incremental update |
 | `removeProjectIndex` | `(projectPath) → Promise<void>` | Delete index, code graph, and context artifacts |
 
+### startup.ts
+
+`autoResumeIndexedProjects()` checks `SOCRATICODE_AUTO_RESUME=off` before Docker, Qdrant, explicit project lists, or any persisted-index access. Otherwise it preserves the existing current-project, explicit-list, and `all` modes. Watcher starts from startup pass through `startWatchingAutomatically`, so `manual` and `off` suppress the watcher without suppressing the catch-up update; combine watcher `off` with auto-resume `off` for a fully deliberate code-index snapshot.
+
 ### watcher.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Returns `true` if now watching (or already was), `false` if another process holds the lock or subscription failed |
+| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Permitted in `auto` and `manual`, rejected before lock acquisition in `off`. Returns `true` if now watching (or already was), `false` if disabled, another process holds the lock, or subscription failed |
+| `startWatchingAutomatically` | `(projectPath, onProgress?) → Promise<boolean>` | Start only in `SOCRATICODE_WATCHER=auto`; shared guard for startup and post-index/update paths |
 | `stopWatching` | `(projectPath) → Promise<void>` | Stop watcher |
 | `stopAllWatchers` | `() → Promise<void>` | Stop all watchers |
 | `isWatching` | `(projectPath) → boolean` | Check if a project is being watched **by this process** |
 | `isWatchedByAnyProcess` | `(projectPath) → Promise<boolean>` | Cross-process check: local subscriptions first, then file-based lock |
 | `getWatchedProjects` | `() → string[]` | List watched paths |
-| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists |
+| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start in `auto` mode with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists. Returns before storage access in `manual`/`off` |
 | `clearExternalWatchCache` | `() → void` | Clear the external watch TTL cache (for testing) |
 
 Watcher settings:
@@ -826,13 +854,16 @@ Watcher settings:
 - Auto-stops after 10 consecutive errors
 - Cross-process lock prevents duplicate watchers
 - Cross-process status awareness: `codebase_status` and `codebase_search` detect watchers running in other MCP processes via file-based locks
-- Auto-starts on first tool interaction with an indexed project (search, status, update, graph), with 60-second TTL cache to avoid retrying when another process holds the lock
+- Auto-starts on first tool interaction with an indexed project (search, status, update, graph) only in `auto`, with 60-second TTL cache to avoid retrying when another process holds the lock
+- `manual` disables every automatic watcher start but leaves explicit `codebase_watch start` available; `off` rejects explicit starts too
+- Watcher mode is process-local. Every MCP process sharing a checkout must use the same snapshot setting; status warns when an `off` process detects another watcher
 
 ### code-graph.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `buildCodeGraph` | `(projectPath, extraExtensions?, progress?) → Promise<CodeGraph>` | Build dependency graph via ast-grep with optional progress tracking |
+| `getExistingGraph` | `(projectPath) → Promise<CodeGraph \| null>` | Load a cached or persisted graph without creating one |
 | `getOrBuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Get cached graph or build new one |
 | `rebuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Force rebuild with concurrency guard (joins existing build if in progress) |
 | `invalidateGraphCache` | `(projectPath) → void` | Clear cached graph for project |
@@ -992,13 +1023,15 @@ npx tsx scripts/benchmark-graph.ts /absolute/path/to/repo
 |----------|-----------|-------------|
 | `extractImports` | `(source, lang, ext) → ImportInfo[]` | Extract imports from source using ast-grep AST patterns |
 
-Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, Go, Rust, Ruby, PHP, C, C++, C#, Swift, Scala, Bash, Dart, and Lua.
+Supports 19+ languages including TypeScript, JavaScript, Python, Java, Kotlin, Go, Rust, Ruby, PHP, C, C++, C#, Swift, Scala, Bash, Dart, Lua, and GDScript.
+
+**GDScript (Godot) support is conditional**: the `tree-sitter-gdscript` native addon is an optional dependency resolved via `node-gyp-build`. A preflight check in an isolated child process (`gdscript-preflight.cjs`) validates the addon's N-API compatibility, ast-grep registration symbol, and parse capability before registration. When the preflight passes, AST-based extraction avoids false matches in comments and strings. When it fails, a lightweight lexer provides syntax-aware preload/load/extends extraction and line-based chunking without treating comments or strings as code. Relative `extends` and `preload` paths resolve from the script directory; relative runtime `load` paths resolve from the Godot project root. Godot resource files (`.tscn`/`.tres`) use a tokenizer-based extractor that handles arbitrary whitespace, attribute order, and `uid://` paths. See the [TSCN file format docs](https://docs.godotengine.org/en/stable/engine_details/file_formats/tscn.html) for the resource format specification.
 
 ### graph-resolution.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?, phpFqcnMap?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
+| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?, phpFqcnMap?, rustCrates?, rustDeclaredMods?, rustIsDeclaration?, classNameIndex?, godotProjectRoot?, godotUidIndex?, fallbackSpecifier?, godotImportKind?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
 | `buildJvmSuffixMap` | `(fileSet) → Map<string, string>` | Java/Kotlin/Scala: class-name suffix → file, for multi-module source layouts |
 | `buildCsNamespaceMap` | `(fileSet, projectPath) → Map<string, string[]>` | C#: `namespace X.Y` declarations → contributing files, resolving `using` directives |
 | `buildGoModuleInfo` | `(fileSet, projectPath) → GoModuleInfo[]` | Go: one entry per `go.mod` (root and nested), package dir → representative file |
@@ -1009,6 +1042,11 @@ Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, G
 | `pythonRootsForFile` | `(manifests, relSourceDir) → string[]` | Python: the import roots that apply to one file, ancestry- and membership-scoped, nearest first |
 | `buildElixirModuleMap` | `(fileSet, projectPath) → Map<string, string[]>` | Elixir: `defmodule` name → declaring files (AST-derived), resolving `alias`/`import`/`require`/`use` |
 | `hasLiteralShellPathShape` | `(specifier) → boolean` | Shell: whether a `source` argument is a literal path worth resolving |
+| `buildClassNameIndex` | `(projectPath, fileSet) → ClassNameIndex` | GDScript: legacy global class_name index retained for compatibility; use `buildGodotProjectIndexes` for project-scoped resolution |
+| `buildGodotProjectIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectIndexes` | GDScript: per-project class_name indexes, keyed by Godot project root |
+| `buildGodotUidIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectUidIndexes` | GDScript: per-project uid:// → relative path index, from .uid sidecars and .tscn/.tres headers |
+| `findGodotProjectRootForProject` | `(projectPath) → string \| null` | GDScript: find Godot project root (directory containing project.godot) |
+| `findGodotRootForFile` | `(sourceFile, godotProjectIndexes?, rootCache?) → string \| null` | GDScript: find nearest project.godot ancestor for a single file |
 
 The `GoModuleInfo` and `PythonManifest` interfaces are exported alongside their builders.
 
@@ -1112,6 +1150,8 @@ Parameters:
 
 Returns: Status message or list of watched projects
 ```
+
+`SOCRATICODE_WATCHER=manual` suppresses automatic starts but permits the `start` action. `off` rejects `start` before infrastructure or catch-up work and reports the watcher as disabled. `stop` remains available in all modes. Use `SOCRATICODE_AUTO_RESUME=off` as well when startup must not run an incremental catch-up or resume interrupted indexing.
 
 ### Query Tools
 
@@ -1467,7 +1507,8 @@ Edit `CHUNK_SIZE` and `CHUNK_OVERLAP` in `src/constants.ts`. Smaller chunks give
 
 1. Set `EMBEDDING_PROVIDER` in your MCP config env block (`ollama`, `openai`, or `google`).
 2. Optionally override `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` for the chosen provider (auto-detected defaults exist for all built-in models).
-3. Re-index all projects (`codebase_remove` then `codebase_index`) since existing vectors have different dimensions.
+3. Existing collections continue using their stored effective profile. Confirm pending differences with `codebase_status`.
+4. Activate the requested settings for each intended collection with `codebase_remove`, then `codebase_index`.
 
 See `src/services/embedding-config.ts` for all supported environment variables and per-provider defaults.
 
@@ -1485,13 +1526,14 @@ Edit `DEFAULT_IGNORE_PATTERNS` in `src/services/ignore.ts`.
 
 ## VS Code / Open VSX Extension
 
-The repo also ships a regular VS Code extension that auto-registers the
-SocratiCode MCP server in any MCP-aware host (Copilot agent mode, Cline,
-Continue, Roo Code) and adds native UI: sidebar, status bar, interactive
-graph webview, walkthrough, and palette commands. The same `.vsix` is
-published to both VS Code Marketplace and Open VSX, so it installs in
-Cursor, VSCodium, Gitpod, code-server, Theia, Antigravity, and Particle
-Workbench in addition to stock VS Code.
+The repo also ships a regular VS Code extension that registers the
+SocratiCode MCP server with the editor's native MCP registry through
+`vscode.lm.registerMcpServerDefinitionProvider`. It also adds native UI:
+sidebar, status bar, interactive graph webview, walkthrough, and palette
+commands. The same `.vsix` is published to both VS Code Marketplace and
+Open VSX. A VS Code-derived editor must implement the MCP provider API for
+native MCP registration to work. Independent clients such as Cline,
+Continue, and Roo Code require their own MCP configuration.
 
 Source: [`extension/`](./extension)
 
@@ -1574,12 +1616,11 @@ npm run publish:all
 
 ### Versioning
 
-The extension's version tracks the engine version. The
-`scripts/bump-plugin-versions.mjs` `release-it` hook bumps
-`extension/package.json` along with every plugin manifest, so an engine
-release `vX.Y.Z` automatically bumps the extension to `X.Y.Z`. Patch
-drift is allowed for extension-only hotfixes (e.g. release the engine
-at `1.7.2` but ship the extension at `1.7.3` for a UI bug fix).
+The shipped integrations track the engine version. The
+`scripts/bump-plugin-versions.mjs` `release-it` hook updates every plugin
+manifest, `gemini-extension.json`, `extension/package.json`, and both version
+fields in `extension/package-lock.json`. An engine release `vX.Y.Z` therefore
+publishes matching integration metadata.
 
 ### What the extension does NOT do
 
@@ -1588,7 +1629,7 @@ at `1.7.2` but ship the extension at `1.7.3` for a UI bug fix).
   registered MCP server. The extension is a thin distribution and UI
   shell.
 - It does **not** ship its own copy of the engine. The engine launches
-  via `npx -y socraticode` (configurable via the `socraticode.command` /
+  via `npx -y --prefer-online socraticode@latest` (configurable via the `socraticode.command` /
   `socraticode.args` settings).
 - It does **not** add language-server features (code lenses, hovers,
   diagnostics). Those would conflict with the host editor's existing
@@ -1620,7 +1661,7 @@ Make sure the project has been indexed first (`codebase_index`). Check the statu
 
 ### Code graph returns empty
 
-The code graph uses ast-grep for AST-based import extraction. It works for 18+ languages. If a file has no recognised imports (or uses non-standard import patterns), it may appear as an orphan node.
+The code graph uses ast-grep for AST-based import extraction. It works for 19+ languages. If a file has no recognised imports (or uses non-standard import patterns), it may appear as an orphan node.
 
 ### Large codebase is slow to index
 

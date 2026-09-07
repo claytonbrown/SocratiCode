@@ -17,10 +17,12 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
 import type { ArtifactIndexState } from "../../src/types.js";
 
 let rootDir: string;
 let existingMetadata: ArtifactIndexState[] | null = null;
+let existingProfile: EffectiveIndexProfile | null = null;
 const upsertedContent: string[] = [];
 
 vi.mock("../../src/services/embeddings.js", () => ({
@@ -30,6 +32,16 @@ vi.mock("../../src/services/embeddings.js", () => ({
   ),
 }));
 
+vi.mock("../../src/services/embedding-provider.js", () => ({
+  getEmbeddingProvider: vi.fn(async () => ({
+    ensureReady: vi.fn(async () => ({
+      modelPulled: false,
+      containerStarted: false,
+      imagePulled: false,
+    })),
+  })),
+}));
+
 vi.mock("../../src/services/qdrant.js", () => ({
   deleteArtifactChunks: vi.fn(async () => undefined),
   deleteCollection: vi.fn(async () => undefined),
@@ -37,13 +49,19 @@ vi.mock("../../src/services/qdrant.js", () => ({
   ensureCollection: vi.fn(async () => undefined),
   ensurePayloadIndex: vi.fn(async () => undefined),
   getCollectionInfo: vi.fn(async () => ({ pointsCount: 1 })),
-  loadContextMetadata: vi.fn(async () => existingMetadata),
+  loadContextIndexMetadata: vi.fn(async () =>
+    existingMetadata === null && existingProfile === null
+      ? null
+      : { artifacts: existingMetadata ?? [], effectiveProfile: existingProfile },
+  ),
   saveContextMetadata: vi.fn(async (
     _collection: string,
     _projectPath: string,
     artifacts: ArtifactIndexState[],
+    effectiveProfile: EffectiveIndexProfile,
   ) => {
     existingMetadata = [...artifacts];
+    existingProfile = effectiveProfile;
   }),
   searchChunks: vi.fn(async () => []),
   searchChunksWithFilter: vi.fn(async () => []),
@@ -70,6 +88,7 @@ let caseIndex = 0;
 beforeEach(() => {
   caseIndex += 1;
   existingMetadata = null;
+  existingProfile = null;
   upsertedContent.length = 0;
 });
 

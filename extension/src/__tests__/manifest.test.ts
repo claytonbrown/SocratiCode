@@ -96,6 +96,16 @@ describe("extension manifest", () => {
     }
   });
 
+  test("checks npm for the latest published engine on server startup", () => {
+    const props = manifest.contributes?.configuration?.properties ?? {};
+    assert.equal(props["socraticode.command"].default, "npx");
+    assert.deepEqual(props["socraticode.args"].default, [
+      "-y",
+      "--prefer-online",
+      "socraticode@latest",
+    ]);
+  });
+
   test("uses an MCP-host-compatible activation event", () => {
     const events = manifest.activationEvents ?? [];
     assert.ok(

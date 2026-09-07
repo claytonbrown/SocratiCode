@@ -455,6 +455,9 @@ import static java.lang.Math.PI;
   // ── Rust ───────────────────────────────────────────────────────────────
 
   describe("Rust imports", () => {
+    const specsOf = (source: string): string[] =>
+      extractImports(source, "rust", ".rs").map((i) => i.moduleSpecifier);
+
     it("extracts use statements", () => {
       const source = `
 use std::collections::HashMap;
@@ -465,6 +468,828 @@ mod config;
       const specs = imports.map((i) => i.moduleSpecifier);
 
       expect(specs.length).toBeGreaterThan(0);
+    });
+
+    it("extracts module declarations behind a visibility modifier", () => {
+      const specs = specsOf(`
+mod private_one;
+pub mod public_one;
+pub(crate) mod crate_visible;
+pub(in crate::outer) mod scoped;
+`);
+
+      expect(specs).toEqual(["private_one", "public_one", "crate_visible", "scoped"]);
+    });
+
+    it("extracts re-exports", () => {
+      const specs = specsOf(`
+pub use crate::config::Config;
+pub(crate) use crate::db::Pool;
+`);
+
+      expect(specs).toEqual(["crate::config::Config", "crate::db::Pool"]);
+    });
+
+    it("still skips inline module definitions", () => {
+      const specs = specsOf(`
+pub mod inline {
+    pub fn thing() {}
+}
+mod declared;
+`);
+
+      expect(specs).toEqual(["declared"]);
+    });
+
+    it("expands a use group into one path per leaf", () => {
+      const specs = specsOf("use crate::{parser, printer::Printer};");
+
+      expect(specs).toEqual(["crate::parser", "crate::printer::Printer"]);
+    });
+
+    it("expands nested use groups", () => {
+      const specs = specsOf("use crate::{a::{b, c}, d};");
+
+      expect(specs).toEqual(["crate::a::b", "crate::a::c", "crate::d"]);
+    });
+
+    it("reads self and glob leaves as the module they name", () => {
+      const specs = specsOf(`
+use crate::config::{self, Config};
+use crate::helpers::*;
+`);
+
+      expect(specs).toEqual(["crate::config", "crate::config::Config", "crate::helpers"]);
+    });
+
+    it("drops the alias from a renamed import", () => {
+      const specs = specsOf("use crate::models::User as DomainUser;");
+
+      expect(specs).toEqual(["crate::models::User"]);
+    });
+
+    it("reads a use declaration split across lines", () => {
+      const specs = specsOf(`
+use crate::{
+    alpha,
+    beta::Gamma,
+};
+`);
+
+      expect(specs).toEqual(["crate::alpha", "crate::beta::Gamma"]);
+    });
+
+    it("keeps the module a group leaf names when that leaf is renamed", () => {
+      const specs = specsOf(`
+use crate::config::{self as cfg, Config};
+use crate::helpers::{* };
+`);
+
+      // `{self as cfg}` names the same module `{self}` does; comparing the
+      // leaf before removing the alias dropped the import altogether.
+      expect(specs).toEqual(["crate::config", "crate::config::Config", "crate::helpers"]);
+    });
+
+    it("keeps the leading :: that says the head is a crate", () => {
+      const specs = specsOf(`
+use ::config::Item;
+use ::serde::{Serialize, Deserialize};
+`);
+
+      expect(specs).toEqual(["::config::Item", "::serde::Serialize", "::serde::Deserialize"]);
+    });
+
+    it("keeps the leading :: when the group opens on it", () => {
+      // `::{…}` carries the marker in the group prefix and nowhere else.
+      // Stripping the trailing `::` left the empty string, which reads the same
+      // as a group with no prefix, and the path resolved into the local module
+      // again — the capture the marker exists to prevent.
+      const specs = specsOf(`
+use ::{corelib::marker};
+use ::{corelib::marker, log::Level};
+`);
+
+      expect(specs).toEqual([
+        "::corelib::marker",
+        "::corelib::marker",
+        "::log::Level",
+      ]);
+    });
+
+    it("leaves a group with no prefix alone", () => {
+      // The guard above must not turn every prefix-less group into a global
+      // path: `use {a, b};` names two paths in the file's own scope.
+      const specs = specsOf("use {alpha, beta::Gamma};");
+
+      expect(specs).toEqual(["alpha", "beta::Gamma"]);
+    });
+
+    it("finds a path attribute with a comment between it and the mod", () => {
+      const specs = specsOf(`
+#[path = "elsewhere/moved.rs"]
+// kept here because the generator writes it there
+mod moved;
+`);
+
+      expect(specs).toEqual(["elsewhere/moved.rs"]);
+    });
+
+    it("ignores comments written between the leaves of a use group", () => {
+      const specs = specsOf(`
+use crate::{
+    // the one we need
+    models::User,
+    /* and this one */ helpers::format,
+};
+`);
+
+      expect(specs).toEqual(["crate::models::User", "crate::helpers::format"]);
+    });
+
+    it("names the module a raw identifier escapes, not its escape", () => {
+      const specs = specsOf(`
+pub mod r#async;
+use crate::r#type::Kind;
+use crate::r#match::Pattern as r#final;
+`);
+
+      // `use` declarations are read before `mod` ones, hence the order.
+      expect(specs).toEqual(["crate::type::Kind", "crate::match::Pattern", "async"]);
+    });
+
+    it("takes the file of a mod from its path attribute", () => {
+      const specs = specsOf(`
+#[path = "elsewhere/moved.rs"]
+mod moved;
+#[cfg(test)]
+#[path = "fixtures/support.rs"]
+mod support;
+mod conventional;
+`);
+
+      expect(specs).toEqual(["elsewhere/moved.rs", "fixtures/support.rs", "conventional"]);
+    });
+
+    it("takes the file of a mod from a cfg_attr path attribute", () => {
+      // The platform-abstraction idiom, and the Rust Reference's own example:
+      // the module `sys` is `unix.rs` here and `windows.rs` there, and
+      // `src/sys.rs` is never read. Reading only the bare form both drew an
+      // edge to that unread file and missed the one carrying the crate body.
+      //
+      // One path per named file, because the graph does not fix a target or a
+      // feature set — the same reading `#[cfg(…)] mod` already gets.
+      //
+      // Nearest the `mod` first: the attributes are walked backwards from it,
+      // which is where a lone `#[path]` was already read from.
+      //
+      // The plain name closes the list, because a `cfg_attr` applies only where
+      // its condition holds and where none does the module is the file its name
+      // implies — `errno`'s own `src/sys.rs` is written for exactly that case.
+      const specs = specsOf(`
+#[cfg_attr(unix, path = "unix.rs")]
+#[cfg_attr(windows, path = "windows.rs")]
+mod sys;
+`);
+
+      expect(specs).toEqual(["windows.rs", "unix.rs", "sys"]);
+    });
+
+    it("reads the declarations written inside a macro invocation", () => {
+      // tree-sitter keeps a macro body as an unparsed token tree, so nothing in
+      // it was a node and half of tokio's `mod` declarations — 256 of 535 —
+      // were invisible, along with 348 `use`. Expansion happens before name
+      // resolution: what is written in there is a declaration like any other.
+      const specs = specsOf(`
+mod plain;
+
+cfg_io_util! {
+    mod async_buf_read_ext;
+    pub use async_buf_read_ext::AsyncBufReadExt;
+
+    mod buf_reader;
+}
+`);
+
+      expect(specs).toContain("plain");
+      expect(specs).toContain("async_buf_read_ext");
+      expect(specs).toContain("buf_reader");
+      expect(specs).toContain("async_buf_read_ext::AsyncBufReadExt");
+    });
+
+    it("does not read a macro body as a module level of its own", () => {
+      // The body is unwrapped in place, so what encloses it still counts and
+      // the macro itself does not: `mod x;` inside `cfg_windows! { … }` written
+      // in `mod inner { … }` names `inner/x`, not `cfg_windows/x` and not `x`.
+      const specs = specsOf(`
+mod inner {
+    cfg_windows! {
+        mod named_pipe;
+    }
+}
+`);
+
+      expect(specs).toEqual(["self::inner::named_pipe"]);
+    });
+
+    it("reads a #[path] declaration written inside a macro invocation", () => {
+      // tokio's `atomic_u64.rs` writes exactly this, twice: the module is
+      // always `imp`, and only the attribute says which file it is.
+      const specs = specsOf(`
+cfg_has_atomic_u64! {
+    #[path = "atomic_u64_native.rs"]
+    mod imp;
+}
+
+cfg_not_has_atomic_u64! {
+    #[path = "atomic_u64_as_mutex.rs"]
+    mod imp;
+}
+`);
+
+      expect(specs).toEqual(["atomic_u64_native.rs", "atomic_u64_as_mutex.rs"]);
+    });
+
+    it("does not read a macro body written as an expression", () => {
+      // A proc-macro's `quote! { … }` builds the tokens its *caller* will get:
+      // the module is declared there, not here. Checked on cargo 1.98.0 with a
+      // `compile_error!` in `src/generated.rs` — the crate builds clean and its
+      // dep-info names `src/lib.rs` alone, while the graph had drawn the file
+      // as a dependency, twice.
+      //
+      // The rule is read off the tree, not off the macro's name: a body holds
+      // items only where the invocation itself may be one. Both spellings are
+      // checked, the method receiver and the tail expression — the second is
+      // the idiom of every `fn … -> TokenStream`, and it is the reason a block
+      // does not count as an item position.
+      for (const body of [
+        "    quote! {\n        mod generated;\n        pub use generated::Thing;\n    }\n    .into()",
+        "    quote! {\n        mod generated;\n        pub use generated::Thing;\n    }",
+      ]) {
+        const specs = specsOf(`
+use quote::quote;
+
+pub fn emit() -> TokenStream {
+${body}
+}
+`);
+
+        expect(specs, `body: ${body}`).not.toContain("generated");
+        expect(specs, `body: ${body}`).not.toContain("generated::Thing");
+      }
+    });
+
+    it("reads a macro body written where an item may stand", () => {
+      // The other side of the same rule, in the two places that count: the file
+      // itself and a `mod` body. An `impl` body counts too — tokio writes a
+      // `cfg_unstable! { fn … { use …; } }` in one.
+      const specs = specsOf(`
+cfg_a! {
+    mod at_file;
+}
+
+mod holder {
+    cfg_b! {
+        mod in_mod;
+    }
+}
+
+impl Thing {
+    cfg_c! {
+        fn f() { use crate::in_impl::Marker; }
+    }
+}
+`);
+
+      expect(specs).toContain("at_file");
+      expect(specs).toContain("self::holder::in_mod");
+      expect(specs).toContain("crate::in_impl::Marker");
+    });
+
+    it("still reads a body the parser recovers from without leaving it", () => {
+      // The complement of the test below, and the reason the guard is drawn
+      // around where recovery reaches rather than around the ERROR node.
+      // `cfg_if!` at file level leaves an ERROR on the attribute and moves
+      // nothing: the declarations in the arms are read where they were written,
+      // which is where rustc reads them too.
+      //
+      // Refusing every body that does not parse as items on its own would cost
+      // this case: 449 macro bodies carrying declarations across a 1,256-crate
+      // registry cache do not, and 431 of them stand at file level. `js-sys`,
+      // `backtrace`, `ahash` and `aes` each lose real module edges that way.
+      const specs = specsOf(`
+cfg_if! {
+    if #[cfg(unix)] {
+        mod arm_a;
+        pub use arm_a::Thing;
+    } else {
+        mod arm_b;
+    }
+}
+
+mod after;
+`);
+
+      expect(specs).toContain("arm_a");
+      expect(specs).toContain("arm_b");
+      expect(specs).toContain("arm_a::Thing");
+      expect(specs).toContain("after");
+    });
+
+    it("reads a macro nested inside one, beside a body the parser recovers from", () => {
+      // The second unwrap pass reads a source the first one rewrote, so the
+      // ERROR a kept `cfg_if!` leaves behind is in its input. Counting that
+      // against the pass cost `deep` its edge — a macro one level further in,
+      // with nothing wrong with it, punished for its neighbour.
+      const specs = specsOf(`
+cfg_if! {
+    if #[cfg(unix)] {
+        mod arm_a;
+    } else {
+        mod arm_b;
+    }
+}
+
+outer! {
+    inner! {
+        mod deep;
+    }
+}
+`);
+
+      expect(specs).toContain("deep");
+      expect(specs).toContain("arm_a");
+    });
+
+    it("leaves a body alone when recovery reaches past the macro", () => {
+      // `cfg_if!` writes its arms as `if #[cfg(…)] { … } else { … }`, and an
+      // `if` carrying an attribute is not Rust anywhere. Blanking the head and
+      // the outer braces hands the parser a fragment it recovers from, and
+      // recovery does not stop at the macro: the enclosing `mod` is closed
+      // after the first arm and what follows is re-parented to file level.
+      //
+      // Cargo-verified: a crate with this shape builds clean while the graph
+      // drew `src/lib.rs -> src/arm_b.rs` twice and `src/lib.rs -> src/dopo.rs`
+      // — three edges into files carrying `compile_error!`, one of them a
+      // module that belongs to the block.
+      //
+      // `cfg_io_util!` is the control. Without it an assertion about what is
+      // missing would also pass with body reading turned off entirely.
+      const specs = specsOf(`
+cfg_io_util! {
+    mod control;
+}
+
+mod inner {
+    mod before;
+    cfg_if! {
+        if #[cfg(unix)] {
+            mod arm_a;
+        } else if #[cfg(windows)] {
+            mod arm_b;
+        } else {
+            mod arm_c;
+        }
+    }
+    mod after;
+}
+`);
+
+      expect(specs).toContain("control");
+      expect(specs).toContain("self::inner::before");
+      expect(specs).toContain("self::inner::after");
+      // Not at file level, and not anywhere: the arms stay unread.
+      expect(specs).not.toContain("after");
+      expect(specs.filter((s) => s.includes("arm_"))).toEqual([]);
+    });
+
+    it("gives up only the macro that let recovery out, not the file it is in", () => {
+      // The retry that saves the rest of the file, and nothing was holding it:
+      // a mutation pass found that pinning `insideBlock` to either value left
+      // the whole suite green. What it costs is measurable — the narrow retry
+      // is worth 22 distinct dependencies across the 153 crates of a registry
+      // cache that carry the shape, ahash and dashmap among them, where one
+      // `cfg_if!` written in an `impl` used to take every file-level one with
+      // it.
+      //
+      // Three macros in one file is what it takes to see: a clean one, an
+      // unparsable one at file level, and an unparsable one inside a block.
+      // Only the last is given up.
+      const specs = specsOf(`
+cfg_clean! {
+    mod clean_mod;
+}
+
+cfg_if! {
+    if #[cfg(unix)] {
+        mod file_arm_a;
+    } else {
+        mod file_arm_b;
+    }
+}
+
+mod inner {
+    mod before;
+    cfg_if! {
+        if #[cfg(unix)] {
+            mod arm_a;
+        } else {
+            mod arm_b;
+        }
+    }
+    mod after;
+}
+`);
+
+      expect(specs).toContain("clean_mod");
+      expect(specs).toContain("file_arm_a");
+      expect(specs).toContain("file_arm_b");
+      // The block keeps its own declarations, and the arms inside it stay unread.
+      expect(specs).toContain("self::inner::before");
+      expect(specs).toContain("self::inner::after");
+      expect(specs.filter((s) => s.includes("arm_a") && !s.startsWith("file_"))).toEqual([]);
+    });
+
+    it("leaves the body alone when the file was already failing to parse", () => {
+      // The way back into the defect, found by trying to get around the guard:
+      // if the ERROR nodes a source already had were forgiven, a file carrying
+      // an unresolved merge marker inside the block would have one at the same
+      // index recovery produces — and the damaged pass came back, with
+      // `mod after;` drawn at file level, where rustc never looks for it.
+      //
+      // So nothing is forgiven but the macros actually unwrapped, and a source
+      // broken for its own reasons gets no unwrapping at all.
+      const specs = specsOf(`
+mod inner {
+    mod before;
+    cfg_if! {
+        if #[cfg(unix)] {
+            mod arm_a;
+        } else {
+            mod arm_b;
+        }
+    }
+    mod after;
+<<<<<<< HEAD
+}
+`);
+
+      expect(specs).toContain("self::inner::before");
+      expect(specs).not.toContain("after");
+      expect(specs.filter((s) => s.includes("arm_"))).toEqual([]);
+    });
+
+    it("does not let a macro accepted on the first pass forgive what the second one breaks", () => {
+      // Found by review. `outer!` wraps items and is accepted whole on the
+      // first pass, with no ERROR anywhere. On the second pass the `cfg_if!`
+      // inside `mod k` closes the block early — the same damage the guard was
+      // written for — but the orphan `}` that should reject the pass now lies
+      // inside `outer!`'s own region. Forgiving everything inside a macro an
+      // earlier pass unwrapped accepted it, and `mod z;` was drawn at file
+      // level again, where rustc never looks for it.
+      //
+      // What an earlier pass hands on is therefore the exact ERRORs its tree
+      // had, and this file has none to hand on.
+      const specs = specsOf(`
+outer! {
+    mod k {
+        mod before;
+        cfg_if! {
+            if #[cfg(unix)] {
+                mod arm_a;
+            } else {
+                mod arm_b;
+            }
+        }
+        mod z;
+    }
+}
+`);
+
+      expect(specs).toContain("self::k::before");
+      expect(specs).toContain("self::k::z");
+      expect(specs).not.toContain("z");
+      expect(specs.filter((s) => s.includes("arm_"))).toEqual([]);
+    });
+
+    it("keeps the second pass's reading of a line the first pass read with less in view", () => {
+      // Found by review. On the first pass the glob is hidden in `cfg_test!`'s
+      // token tree, so `outer::Thing` is a bare head in a block with nothing
+      // anchoring it; the second pass sees the glob and reads the same line as
+      // a path the block may answer. Keyed on that flag, both readings were
+      // kept — and the first, resolved with no declarations in scope, could
+      // reach a workspace crate named `outer` that rustc refuses with E0432.
+      const imports = extractImports(
+        `
+mod outer;
+
+#[cfg(test)]
+mod tests {
+    cfg_test! {
+        use super::*;
+    }
+    use outer::Thing;
+}
+`,
+        "rust",
+        ".rs",
+      ).filter((i) => i.moduleSpecifier === "outer::Thing");
+
+      expect(imports).toHaveLength(1);
+      expect(imports[0].fromInlineBlock).toBeUndefined();
+    });
+
+    it("leaves a parenthesised macro invocation alone", () => {
+      // Only `{}` is unwrapped: a `()` or `[]` invocation carries an
+      // expression, not items. `automod::dir!("tests/builder")` names modules
+      // that are nowhere written, and no reading of the source can find them.
+      const specs = specsOf(`
+mod real;
+automod::dir!("tests/builder");
+let v = vec![1, 2, 3];
+`);
+
+      expect(specs).toEqual(["real"]);
+    });
+
+    it("does not report a declaration twice when it sits outside every macro", () => {
+      // The unwrapped source is re-read whole, so everything the first pass
+      // found comes back with it. Subtracting as a multiset is what keeps the
+      // existing edges, repeats included, exactly as they were.
+      const specs = specsOf(`
+mod outside;
+cfg_io_util! {
+    mod inside;
+}
+`);
+
+      expect(specs.filter((s) => s === "outside")).toHaveLength(1);
+      expect(specs.filter((s) => s === "inside")).toHaveLength(1);
+    });
+
+    it("reads a cfg_attr that names no path as naming none", () => {
+      // Only `path` is picked out of what a `cfg_attr` would apply; a
+      // `cfg_attr` carrying anything else leaves the module on convention.
+      const specs = specsOf(`
+#[cfg_attr(docsrs, doc(cfg(feature = "full")))]
+mod plain;
+`);
+
+      expect(specs).toEqual(["plain"]);
+    });
+
+    it("marks a path attribute written inside an inline module", () => {
+      const specs = specsOf(`
+mod block {
+    #[path = "moved.rs"]
+    mod inner;
+}
+`);
+
+      // rustc counts this one from the file's own module directory, one
+      // directory deeper per inline level — unlike a declared module, which
+      // counts from the directory the file sits in.
+      expect(specs).toEqual(["self/block/moved.rs"]);
+    });
+
+    it("extracts an extern crate declaration", () => {
+      const specs = specsOf(`
+extern crate serde;
+#[macro_use]
+extern crate log;
+extern crate my_lib as shorthand;
+`);
+
+      expect(specs).toEqual(["serde", "log", "my_lib"]);
+    });
+
+    it("places a mod declared inside an inline module under that module", () => {
+      const specs = specsOf(`
+mod outer {
+    mod inner;
+    mod deeper {
+        mod leaf;
+    }
+}
+mod beside;
+`);
+
+      expect(specs).toEqual(["self::outer::inner", "self::outer::deeper::leaf", "beside"]);
+    });
+
+    it("counts an inline module as a level a super:: path climbs", () => {
+      const specs = specsOf(`
+use super::sibling::Thing;
+
+#[cfg(test)]
+mod tests {
+    use super::helper;
+    use super::super::sibling::Other;
+}
+`);
+
+      // At file level `super` reaches the parent module; the same word inside
+      // `mod tests` reaches the file itself, so it takes one more to leave it.
+      expect(specs).toEqual(["super::sibling::Thing", "self::helper", "super::sibling::Other"]);
+    });
+
+    it("records nothing for a glob import of the module a test block sits in", () => {
+      const specs = specsOf(`
+#[cfg(test)]
+mod tests {
+    use super::*;
+}
+`);
+
+      // `use super::*;` inside `mod tests` names the file it is written in.
+      expect(specs).toEqual([]);
+    });
+
+    // Whether a bare head written inside an inline block may reach the file's
+    // own declarations. It travels as `fromInlineBlock`, not in the specifier,
+    // which is identical under both readings — an assertion on the string would
+    // pass either way and prove nothing.
+    const blockedOf = (source: string, spec: string): boolean | undefined =>
+      extractImports(source, "rust", ".rs").find((i) => i.moduleSpecifier === spec)?.fromInlineBlock;
+
+    it("does not take a glob from another crate as the anchor", () => {
+      // `use ::other::{*};` reaches outside this crate, so it brings in nothing
+      // the file declares and cannot anchor a bare head. The leading `::` says
+      // so, and stripping the prefix before the check is what let a group of
+      // that shape read as an anchor — the same capture the marker exists to
+      // prevent, in its braced spelling.
+      const source = `
+mod helper;
+
+mod tests {
+    use ::other::{*};
+    use helper::build;
+}
+`;
+
+      expect(specsOf(source)).toContain("::other");
+      expect(blockedOf(source, "helper::build")).toBe(true);
+    });
+
+    it("counts the supers of a glob against the depth it is written at", () => {
+      // One `super` leaves an inline block and lands on the file; written two
+      // blocks deep the same word lands halfway, and brings in nothing the file
+      // declares. Only a glob carrying exactly as many `super`s as there are
+      // levels reaches the file's own scope — dropping that count let a shallow
+      // glob anchor a head it cannot see.
+      const source = `
+mod helper;
+
+mod outer {
+    mod inner {
+        use super::*;
+        use helper::build;
+    }
+}
+`;
+
+      expect(blockedOf(source, "helper::build")).toBe(true);
+    });
+
+    it("follows a bare head into the inline block that declares it", () => {
+      const specs = specsOf(`
+#[cfg(test)]
+mod tests {
+    mod fixtures;
+    use fixtures::build_store;
+}
+`);
+
+      // `fixtures` is declared right there, so the path goes into the block —
+      // `src/<file>/tests/fixtures.rs` — and not to a file of that name
+      // sitting beside the declaring one.
+      expect(specs).toEqual(["self::tests::fixtures::build_store", "self::tests::fixtures"]);
+    });
+
+    it("takes the directory of an inline module from its own path attribute", () => {
+      const specs = specsOf(`
+#[path = "other_dir"]
+mod outer {
+    pub mod child;
+}
+`);
+
+      expect(specs).toEqual(["self::other_dir::child"]);
+    });
+
+    it("leaves a crate-anchored path alone inside an inline module", () => {
+      const specs = specsOf(`
+mod tests {
+    use crate::db::Connection;
+    use serde::Deserialize;
+}
+`);
+
+      // `crate::` counts from the crate root, which no inline module moves;
+      // and a bare head may name another crate, which rebasing would lose.
+      expect(specs).toEqual(["crate::db::Connection", "serde::Deserialize"]);
+    });
+
+    it("expands a group whose first leaf is itself a group", () => {
+      const specs = specsOf("use crate::{{parser, printer}, config};");
+
+      // The depth counter has to see the opening brace of the very first
+      // character of the group body. Starting the scan one character in
+      // leaves depth at zero inside the nested group, and the comma that
+      // separates its own leaves is then read as separating the outer ones.
+      expect(specs).toEqual(["crate::parser", "crate::printer", "crate::config"]);
+    });
+
+    it("keeps a single-segment path written inside an inline module", () => {
+      const specs = specsOf(`
+mod tests {
+    use standalone;
+}
+`);
+
+      // One segment is still a path. The block declares nothing by that name,
+      // so it is left alone the way any other bare head is — dropping it
+      // loses the edge entirely.
+      expect(specs).toEqual(["standalone"]);
+    });
+
+    it("keeps a leading :: inside an inline module that declares the same name", () => {
+      const specs = specsOf(`
+mod tests {
+    mod config;
+    use ::config::Item;
+}
+`);
+
+      // The `::` says the head names a crate, and it says so precisely where
+      // a module of that name is in scope — which is the one case where
+      // rebasing the path into the block would reach the wrong file.
+      expect(specs).toEqual(["::config::Item", "self::tests::config"]);
+    });
+
+    it("counts a self:: path from the inline module it is written in", () => {
+      const specs = specsOf(`
+mod tests {
+    use self::helper::run;
+}
+`);
+
+      // Inside `mod tests`, `self` is the block, so read from the file the
+      // path names `tests::helper` — one level below where it would land if
+      // the block were not there.
+      expect(specs).toEqual(["self::tests::helper::run"]);
+    });
+
+    it("joins every inline level a rebased bare head passes through", () => {
+      const specs = specsOf(`
+mod outer {
+    mod inner {
+        mod fixtures;
+        use fixtures::build;
+    }
+}
+`);
+
+      // Two levels, so the separator between them is written rather than
+      // implied — a single level hides a missing `::` because there is
+      // nothing to join.
+      expect(specs).toEqual([
+        "self::outer::inner::fixtures::build",
+        "self::outer::inner::fixtures",
+      ]);
+    });
+
+    it("marks a module declaration as a static import, whichever form it takes", () => {
+      const imports = extractImports(
+        `
+#[path = "elsewhere/moved.rs"]
+mod moved;
+mod conventional;
+`,
+        "rust",
+        ".rs",
+      );
+
+      // The flag decides the edge's type in the graph. A `mod` declaration is
+      // as static as an import gets: nothing about it is decided at run time.
+      expect(imports.map((i) => i.isDynamic)).toEqual([false, false]);
+    });
+
+    it("marks an extern crate declaration as a static import", () => {
+      const imports = extractImports("extern crate serde;", "rust", ".rs");
+
+      expect(imports.map((i) => i.isDynamic)).toEqual([false]);
+    });
+
+    it("records nothing for a crate that renames itself", () => {
+      const specs = specsOf(`
+extern crate self as this_crate;
+extern crate serde;
+`);
+
+      // `extern crate self` names the crate the file is already in, which is
+      // no edge — and resolving the word `self` as a module path would reach
+      // the file's own directory.
+      expect(specs).toEqual(["serde"]);
     });
   });
 

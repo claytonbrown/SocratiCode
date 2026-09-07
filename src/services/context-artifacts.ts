@@ -25,6 +25,15 @@ import { CHUNK_OVERLAP, CHUNK_SIZE, DETECT_HEAD_BYTES, MAX_CHUNK_CHARS } from ".
 import type { ArtifactIndexState, ContextArtifact, SearchResult } from "../types.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import {
+  documentTextProfile,
+  type EffectiveIndexProfile,
+  ensureEffectiveEmbeddingReady,
+  indexProfileDifferences,
+  requestedIndexProfile,
+  resolveEffectiveIndexProfile,
+  withEffectiveEmbedding,
+} from "./index-profile.js";
 import { logger } from "./logger.js";
 import {
   deleteArtifactChunks,
@@ -33,12 +42,26 @@ import {
   ensureCollection,
   ensurePayloadIndex,
   getCollectionInfo,
-  loadContextMetadata,
+  loadContextIndexMetadata,
   saveContextMetadata,
   searchChunks,
   searchChunksWithFilter,
   upsertPreEmbeddedChunks,
 } from "./qdrant.js";
+
+/**
+ * Context tools historically provisioned Ollama but did not preflight external
+ * providers through model-list endpoints. Preserve that contract: the actual
+ * embedding request validates external providers without requiring an
+ * additional endpoint or permission.
+ */
+async function ensureContextEmbeddingReady(
+  profile: EffectiveIndexProfile,
+): Promise<void> {
+  if (profile.embedding.provider === "ollama") {
+    await ensureEffectiveEmbeddingReady(profile);
+  }
+}
 
 // ── Config file parsing ──────────────────────────────────────────────────
 
@@ -353,6 +376,7 @@ export function chunkArtifactContent(
   content: string,
   artifactName: string,
   artifactPath: string,
+  maxChunkChars: number = MAX_CHUNK_CHARS,
 ): ArtifactChunk[] {
   if (!content) return [];
   const lines = content.split("\n");
@@ -365,8 +389,8 @@ export function chunkArtifactContent(
     let chunkContent = lines.slice(start, end).join("\n");
 
     // Apply hard character cap
-    if (chunkContent.length > MAX_CHUNK_CHARS) {
-      chunkContent = chunkContent.substring(0, MAX_CHUNK_CHARS);
+    if (chunkContent.length > maxChunkChars) {
+      chunkContent = chunkContent.substring(0, maxChunkChars);
     }
 
     const id = generateChunkId(artifactPath, artifactName, start);
@@ -385,6 +409,27 @@ export function chunkArtifactContent(
   return chunks;
 }
 
+/** Hash the artifact settings that affect embedded text or stored payloads. */
+export function artifactConfigurationSignature(
+  projectPath: string,
+  artifact: ContextArtifact,
+): string {
+  const resolvedProject = path.resolve(projectPath);
+  const resolvedArtifactPath = path.isAbsolute(artifact.path)
+    ? artifact.path
+    : path.resolve(resolvedProject, artifact.path);
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        path: artifact.path,
+        resolvedPath: resolvedArtifactPath,
+        description: artifact.description,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 16);
+}
+
 function generateChunkId(artifactPath: string, artifactName: string, startLine: number): string {
   const hash = createHash("sha256")
     .update(`context:${artifactPath}:${artifactName}:${startLine}`)
@@ -398,7 +443,7 @@ function generateChunkId(artifactPath: string, artifactName: string, startLine: 
 
 /**
  * Index a single artifact into Qdrant.
- * Removes any existing chunks for this artifact first, then inserts new ones.
+ * Generates replacement embeddings before removing the existing chunks.
  *
  * `preread` lets a caller that has *already* read the artifact hand the result
  * over instead of paying for a second full read. {@link ensureArtifactsIndexed}
@@ -412,6 +457,7 @@ export async function indexArtifact(
   artifact: ContextArtifact,
   collection: string,
   preread?: ArtifactContent,
+  suppliedProfile?: EffectiveIndexProfile,
 ): Promise<ArtifactIndexState> {
   const resolvedProject = path.resolve(projectPath);
   const resolvedArtifactPath = path.isAbsolute(artifact.path)
@@ -427,6 +473,27 @@ export async function indexArtifact(
   const { content, contentHash, exclusions } =
     preread ?? (await readArtifactContent(artifact.path, resolvedProject));
 
+  let effectiveProfile = suppliedProfile;
+  if (!effectiveProfile) {
+    const collectionInfo = await getCollectionInfo(collection);
+    const existingMetadata = collectionInfo === null
+      ? null
+      : await loadContextIndexMetadata(collection);
+    effectiveProfile = resolveEffectiveIndexProfile(
+      "context",
+      existingMetadata?.effectiveProfile ?? null,
+      (collectionInfo?.pointsCount ?? 0) > 0,
+      collectionInfo?.denseVectorSize,
+    );
+    await saveContextMetadata(
+      collection,
+      resolvedProject,
+      existingMetadata?.artifacts ?? [],
+      effectiveProfile,
+    );
+    await ensureContextEmbeddingReady(effectiveProfile);
+  }
+
   // Report what the directory walk left out. Logged here rather than in
   // readArtifactContent so it appears once per index, not on every staleness
   // check — and so a shrinking chunk count has a visible cause.
@@ -440,34 +507,50 @@ export async function indexArtifact(
   }
 
   // Chunk
-  const chunks = chunkArtifactContent(content, artifact.name, artifact.path);
+  const configurationSignature = artifactConfigurationSignature(resolvedProject, artifact);
+  const chunks = chunkArtifactContent(
+    content,
+    artifact.name,
+    artifact.path,
+    effectiveProfile.maxChunkChars,
+  );
+
+  // Use the profile that produced the existing vectors. This prevents a runtime
+  // setting change from creating a mixed collection during an incremental update.
+  await withEffectiveEmbedding(effectiveProfile, () => ensureCollection(collection));
+
+  // Ensure artifactName payload index exists (idempotent)
+  await ensurePayloadIndex(collection, "artifactName");
 
   if (chunks.length === 0) {
+    // Empty replacement content must remove any chunks from the prior version.
+    await deleteArtifactChunks(collection, artifact.name);
     logger.warn("Artifact produced zero chunks", { name: artifact.name });
     return {
       name: artifact.name,
       description: artifact.description,
       resolvedPath: resolvedArtifactPath,
+      configurationSignature,
       contentHash,
       lastIndexedAt: new Date().toISOString(),
       chunksIndexed: 0,
     };
   }
 
-  // Ensure collection exists before any operations on it
-  await ensureCollection(collection);
-
-  // Ensure artifactName payload index exists (idempotent)
-  await ensurePayloadIndex(collection, "artifactName");
-
-  // Delete old chunks for this artifact (safe now that collection exists)
-  await deleteArtifactChunks(collection, artifact.name);
-
   // Generate embeddings
   const texts = chunks.map((c) =>
-    prepareDocumentText(c.content, `context:${artifact.name}:${path.normalize(artifact.path)}`),
+    prepareDocumentText(
+      c.content,
+      `context:${artifact.name}:${path.normalize(artifact.path)}`,
+      documentTextProfile(effectiveProfile),
+    ),
   );
-  const embeddings = await generateEmbeddings(texts);
+  const embeddings = await withEffectiveEmbedding(effectiveProfile, () =>
+    generateEmbeddings(texts),
+  );
+
+  // Keep the previous artifact searchable if embedding generation fails.
+  await deleteArtifactChunks(collection, artifact.name);
 
   // Build pre-embedded points
   const points = chunks.map((chunk, i) => ({
@@ -506,6 +589,7 @@ export async function indexArtifact(
     name: artifact.name,
     description: artifact.description,
     resolvedPath: resolvedArtifactPath,
+    configurationSignature,
     contentHash,
     lastIndexedAt: new Date().toISOString(),
     chunksIndexed: chunks.length,
@@ -534,21 +618,76 @@ export async function indexAllArtifacts(projectPath: string): Promise<{
   const configNames = new Set(config.artifacts.map((a) => a.name));
   const stateMap = new Map<string, ArtifactIndexState>();
 
-  const existingStates = await loadContextMetadata(collection);
+  const collectionInfo = await getCollectionInfo(collection);
+  const existingMetadata = collectionInfo === null
+    ? null
+    : await loadContextIndexMetadata(collection);
+  // codebase_context_index refreshes content in place. It is not a fresh-index
+  // operation: existing vectors must retain their stored profile so the refresh
+  // cannot mix representations. The requested profile activates only when no
+  // stored profile exists and the collection has no points.
+  const effectiveProfile = resolveEffectiveIndexProfile(
+    "context",
+    existingMetadata?.effectiveProfile ?? null,
+    (collectionInfo?.pointsCount ?? 0) > 0,
+    collectionInfo?.denseVectorSize,
+  );
+  const existingStates = existingMetadata?.artifacts ?? null;
+  await ensureContextEmbeddingReady(effectiveProfile);
   if (existingStates) {
     for (const state of existingStates) {
-      if (configNames.has(state.name)) {
-        stateMap.set(state.name, state);
+      stateMap.set(state.name, state);
+    }
+  }
+
+  // Persist the effective profile before the first vector mutation. A failed
+  // run can therefore resume without combining two embedding representations.
+  await saveContextMetadata(
+    collection,
+    resolvedProject,
+    [...stateMap.values()],
+    effectiveProfile,
+  );
+
+  for (const state of existingStates ?? []) {
+    if (!configNames.has(state.name)) {
+      try {
+        await deleteArtifactChunks(collection, state.name);
+        stateMap.delete(state.name);
+        await saveContextMetadata(
+          collection,
+          resolvedProject,
+          [...stateMap.values()],
+          effectiveProfile,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error("Failed to remove artifact no longer in config", {
+          name: state.name,
+          error: msg,
+        });
+        errors.push({ name: state.name, error: msg });
       }
     }
   }
 
   for (const artifact of config.artifacts) {
     try {
-      const state = await indexArtifact(resolvedProject, artifact, collection);
+      const state = await indexArtifact(
+        resolvedProject,
+        artifact,
+        collection,
+        undefined,
+        effectiveProfile,
+      );
       indexed.push(state);
       stateMap.set(artifact.name, state);
-      await saveContextMetadata(collection, resolvedProject, [...stateMap.values()]);
+      await saveContextMetadata(
+        collection,
+        resolvedProject,
+        [...stateMap.values()],
+        effectiveProfile,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.error("Failed to index artifact", { name: artifact.name, error: msg });
@@ -559,7 +698,12 @@ export async function indexAllArtifacts(projectPath: string): Promise<{
   // Save final metadata, even if all artifacts failed, so removed artifacts no
   // longer linger in status after a config change.
   if (stateMap.size > 0 || existingStates?.length) {
-    await saveContextMetadata(collection, resolvedProject, [...stateMap.values()]);
+    await saveContextMetadata(
+      collection,
+      resolvedProject,
+      [...stateMap.values()],
+      effectiveProfile,
+    );
   }
 
   return { indexed, errors };
@@ -585,7 +729,18 @@ export async function ensureArtifactsIndexed(projectPath: string): Promise<{
   }
 
   // Load existing metadata
-  const existingStates = await loadContextMetadata(collection);
+  const collectionInfo = await getCollectionInfo(collection);
+  const existingMetadata = collectionInfo === null
+    ? null
+    : await loadContextIndexMetadata(collection);
+  const effectiveProfile = resolveEffectiveIndexProfile(
+    "context",
+    existingMetadata?.effectiveProfile ?? null,
+    (collectionInfo?.pointsCount ?? 0) > 0,
+    collectionInfo?.denseVectorSize,
+  );
+  const existingStates = existingMetadata?.artifacts ?? null;
+  await ensureContextEmbeddingReady(effectiveProfile);
   const stateMap = new Map<string, ArtifactIndexState>();
   if (existingStates) {
     for (const s of existingStates) {
@@ -598,11 +753,14 @@ export async function ensureArtifactsIndexed(projectPath: string): Promise<{
   const errors: Array<{ name: string; error: string }> = [];
   const configNames = new Set(config.artifacts.map((a) => a.name));
 
-  for (const name of [...stateMap.keys()]) {
-    if (!configNames.has(name)) {
-      stateMap.delete(name);
-    }
-  }
+  // Checkpoint the profile before any deletion or upsert for the same reason as
+  // full artifact indexing: interrupted work must retain one representation.
+  await saveContextMetadata(
+    collection,
+    resolvedProject,
+    [...stateMap.values()],
+    effectiveProfile,
+  );
 
   for (const artifact of config.artifacts) {
     try {
@@ -612,16 +770,45 @@ export async function ensureArtifactsIndexed(projectPath: string): Promise<{
       // stale branch it is handed to indexArtifact, which would otherwise walk
       // the directory and re-read every file to reproduce what we hold here.
       const current = await readArtifactContent(artifact.path, resolvedProject);
+      const configurationSignature = artifactConfigurationSignature(resolvedProject, artifact);
 
-      if (existing && existing.contentHash === current.contentHash) {
-        // Up to date
+      if (
+        existing &&
+        existing.contentHash === current.contentHash &&
+        existing.configurationSignature === configurationSignature
+      ) {
+        upToDate.push(artifact.name);
+      } else if (
+        existing &&
+        existing.contentHash === current.contentHash &&
+        existing.configurationSignature === undefined &&
+        existing.description === artifact.description &&
+        existing.resolvedPath ===
+          (path.isAbsolute(artifact.path)
+            ? artifact.path
+            : path.resolve(resolvedProject, artifact.path))
+      ) {
+        // Metadata created before configuration signatures can adopt the known
+        // current path and description without rebuilding its existing vectors.
+        stateMap.set(artifact.name, { ...existing, configurationSignature });
         upToDate.push(artifact.name);
       } else {
         // Stale or new — re-index
-        const state = await indexArtifact(resolvedProject, artifact, collection, current);
+        const state = await indexArtifact(
+          resolvedProject,
+          artifact,
+          collection,
+          current,
+          effectiveProfile,
+        );
         reindexed.push(artifact.name);
         stateMap.set(artifact.name, state);
-        await saveContextMetadata(collection, resolvedProject, [...stateMap.values()]);
+        await saveContextMetadata(
+          collection,
+          resolvedProject,
+          [...stateMap.values()],
+          effectiveProfile,
+        );
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -637,15 +824,22 @@ export async function ensureArtifactsIndexed(projectPath: string): Promise<{
         await deleteArtifactChunks(collection, name);
         stateMap.delete(name);
         logger.info("Removed artifact no longer in config", { name });
-      } catch {
-        // ignore
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error("Failed to remove artifact no longer in config", { name, error: msg });
+        errors.push({ name, error: msg });
       }
     }
   }
 
   // Save updated metadata, even when only removals happened.
   if (stateMap.size > 0 || existingStates?.length) {
-    await saveContextMetadata(collection, resolvedProject, [...stateMap.values()]);
+    await saveContextMetadata(
+      collection,
+      resolvedProject,
+      [...stateMap.values()],
+      effectiveProfile,
+    );
   }
 
   return { reindexed, upToDate, errors };
@@ -718,7 +912,11 @@ export async function getArtifactStatusSummary(projectPath: string): Promise<{
 
   const projectId = projectIdFromPath(resolvedProject);
   const collection = contextCollectionName(projectId);
-  const existingStates = await loadContextMetadata(collection);
+  const collectionInfo = await getCollectionInfo(collection);
+  const existingMetadata = collectionInfo === null
+    ? null
+    : await loadContextIndexMetadata(collection);
+  const existingStates = existingMetadata?.artifacts ?? null;
   const stateMap = new Map(
     existingStates?.map((s) => [s.name, s]) ?? [],
   );
@@ -742,6 +940,26 @@ export async function getArtifactStatusSummary(projectPath: string): Promise<{
   } else {
     lines.push(`Context artifacts: ${indexedCount}/${config.artifacts.length} indexed (${totalChunks} chunks)`);
     lines.push("  Some artifacts are not yet indexed. Run codebase_context_index to index all.");
+  }
+
+
+  const effectiveProfile = resolveEffectiveIndexProfile(
+    "context",
+    existingMetadata?.effectiveProfile ?? null,
+    (collectionInfo?.pointsCount ?? 0) > 0,
+    collectionInfo?.denseVectorSize,
+  );
+  const requestedProfile = requestedIndexProfile("context");
+  const profileDifferences = indexProfileDifferences(effectiveProfile, requestedProfile);
+  if (profileDifferences.length > 0) {
+    lines.push(
+      `Context index profile: ${profileDifferences.length} requested change${profileDifferences.length === 1 ? "" : "s"} pending until a fresh index: ${profileDifferences.join(", ")}`,
+    );
+  }
+  if (effectiveProfile.legacyUnverifiedFields.length > 0) {
+    lines.push(
+      `Context index profile: legacy-unverified fields: ${effectiveProfile.legacyUnverifiedFields.join(", ")}`,
+    );
   }
 
   return { configuredCount: config.artifacts.length, indexedCount, totalChunks, lines };
