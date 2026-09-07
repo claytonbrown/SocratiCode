@@ -1,7 +1,7 @@
 {
   "name": "socraticode",
   "mcpName": "io.github.giancarloerra/socraticode",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "description": "SocratiCode — MCP server for local codebase indexing, semantic search, and code dependency graphs. All private, all local via Docker.",
   "type": "module",
   "main": "dist/index.js",
